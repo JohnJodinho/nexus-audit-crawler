@@ -1,0 +1,16 @@
+MarkItDown_README.md
+spiders_*.md
+venv/
+
+__pycache__/
+
+.scrapling_cache/ 
+
+app/logs/*.log
+
+app/logs/*.jsonl 
+
+app/output.jsonl
+app/async_gens.py
+app/scripts
+app/crawlers
