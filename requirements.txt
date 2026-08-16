@@ -1,0 +1,6 @@
+scrapling
+redis
+pydantic
+pydantic-settings
+markitdown
+anyio

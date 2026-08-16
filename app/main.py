@@ -1,359 +1,456 @@
 """
 app/main.py
 ===========
-Enterprise AI Audit Crawler – Ephemeral Execution Engine.
+Distributed worker loop for the Enterprise AI Audit Crawler.
 
-CRITICAL CONSTRAINT
--------------------
-``Spider.start()`` is explicitly **NOT** used.  All execution goes through
-``spider.stream()``, which is an async generator that yields items one-by-one
-as they are scraped.  This enables real-time item writing without buffering
-the entire result set in memory first.
+Each worker reads one task from ``stream:audit_tasks`` via XREADGROUP,
+evaluates six sequential gates, and runs ``AuditSpider`` as a single-page
+fetcher.  All crawl state is held in Redis; the worker itself is stateless
+across tasks.
 
-Event loop strategy
--------------------
-The documentation mentions ``uvloop`` (Linux/macOS) or ``winloop`` (Windows)
-as optional faster event loops.  Neither is installed in this venv, so we use
-``anyio`` with its default backend (``asyncio``).  The ``anyio.run()`` call
-correctly handles the async entry point on all platforms.
-
-If ``winloop`` or ``uvloop`` becomes available, swap the ``anyio.run()`` call
-for::
-
-    import winloop           # Windows
-    winloop.run(main())
-
-    import uvloop            # Linux / macOS
-    uvloop.run(main())
-
-Output format
--------------
-Scraped items are written to ``./app/output.jsonl`` in JSON Lines format
-(one JSON object per line, UTF-8 encoded).  This format is:
-  - Streamable – items can be read/processed before the crawl finishes.
-  - Append-safe – partial runs don't corrupt previously written data.
-  - LLM-friendly – each line is a self-contained JSON document.
-
-Target configuration
---------------------
-Edit ``TARGET_URL`` and ``TARGET_DOMAIN`` below to point the spider at your
-actual audit target before running.
+Environment variables
+---------------------
+REDIS_URL       Redis connection URL.  Default: redis://localhost:6379/0
+WORKER_COUNT    Concurrent worker coroutines.  Default: 2
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# MUST be the very first executable statements – before any import that could
-# trigger logging handler construction (including Scrapling's Spider base).
-# On Windows, PowerShell/cmd default to the system codepage (e.g. cp1252).
-# Reconfiguring stdout/stderr to UTF-8 here means every StreamHandler in the
-# entire process – including the ones Scrapling creates internally for the
-# spider logger – will use UTF-8, eliminating UnicodeEncodeError on non-ASCII chars.
-# ---------------------------------------------------------------------------
 import sys
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import asyncio
+import datetime
 import json
 import logging
-import pathlib
-import datetime
-from typing import Any, Dict
+import os
+import socket
+from typing import Any, Dict, Optional
 
 import anyio
+import redis.asyncio as aioredis
+import redis.exceptions as redis_exceptions
 
-try:
-    import winloop
-except ImportError:
-    winloop = None
-# Import our spider (Waterfall Session Architecture)
-from app.spider import AuditSpider
-
-# Import the logger helpers so pipeline events land in the shared log file.
 from app.logger import LOG_FILE_PATH, get_pipeline_logger
+from app.redis_client import (
+    CONSUMER_GROUP,
+    MAX_DEPTH,
+    MAX_PAGES_PER_RUN,
+    MAX_RETRIES,
+    SET_VISITED,
+    STREAM_DLQ,
+    STREAM_RESULTS,
+    STREAM_TASKS,
+    acquire_domain_slot,
+    create_redis_pool,
+    ensure_consumer_group,
+    release_domain_slot,
+)
+from app.spider import AuditSpider
+from app.utils.utilities import get_fingerprint, _route_to_dlq
+from app.config import settings
 
-
-# ===========================================================================
-# Configuration – edit these before running
-# ===========================================================================
-
-#: Seed URL – the starting point of the crawl.
-TARGET_URL: str = "https://www.infinitylegal.com.sg"
-
-#: Domain fence – only pages whose hostname matches this (or its subdomains)
-#: will be crawled.  Must match the ``allowed_domains`` set on the spider.
-TARGET_DOMAIN: str = "infinitylegal.com.sg"
-
-#: Output file path – items are streamed here in JSON Lines format.
-#: The directory is created automatically if it doesn't exist.
-_APP_DIR = pathlib.Path(__file__).parent  # …/scrapling/app/
-OUTPUT_PATH: pathlib.Path = _APP_DIR / "output.jsonl"
-
-
-# ===========================================================================
-# Pipeline logger
-# ===========================================================================
-# This logger is distinct from ``self.logger`` inside the Spider.
-# It captures main-loop events (file I/O, startup, shutdown) and is
-# routed to the same ``crawler.log`` file via the logger module helper.
 log: logging.Logger = get_pipeline_logger("audit_crawler.main")
 
+WORKER_COUNT = settings.WORKER_COUNT
+GLOBAL_MAX_PAGES = settings.GLOBAL_MAX_PAGES
+_XREAD_BLOCK_MS: int = 5_000
 
-# ===========================================================================
-# Async main loop
-# ===========================================================================
+CONTAINER_ID = settings.HOSTNAME or socket.gethostname()
+
+
+async def worker_loop(worker_id: str, redis: aioredis.Redis) -> None:
+    """
+    Single stateless worker coroutine.  Runs until cancelled.
+
+    Parameters
+    ----------
+    worker_id:
+        Unique consumer identifier within the Redis consumer group.
+    redis:
+        Shared async Redis connection pool.
+    """
+    log.info("[WORKER:%s] Started. Listening on %s", worker_id, STREAM_TASKS)
+    pages_processed: int = 0
+
+    while True:
+        try:
+            raw_messages: Optional[list] = await redis.xreadgroup(
+                groupname=CONSUMER_GROUP,
+                consumername=worker_id,
+                streams={STREAM_TASKS: ">"},
+                count=1,
+                block=_XREAD_BLOCK_MS,
+            )
+        except redis_exceptions.TimeoutError:
+            log.error(
+                "[WORKER:%s] Redis timeout while reading from stream -- "
+                "check Redis server availability and performance.",
+                worker_id,
+            )
+            continue
+
+        if not raw_messages:
+            continue
+
+        stream_name, entries = raw_messages[0]
+        if not entries:
+            continue
+
+        message_id: str
+        task_fields: Dict[str, str]
+        message_id, task_fields = entries[0]
+
+        url: str = task_fields.get("url", "")
+        depth: int = int(task_fields.get("depth", "0"))
+        retry_count: int = int(task_fields.get("retry_count", "0"))
+        domain: str = task_fields.get("domain", "")
+
+        if not url or not domain:
+            log.warning(
+                "[WORKER:%s] Malformed task (missing url/domain): %s -- "
+                "routing to DLQ.",
+                worker_id,
+                task_fields,
+            )
+            await _route_to_dlq(
+                redis, task_fields, "malformed_task_missing_url_or_domain", log=log
+            )
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+            continue
+
+        log.info(
+            "[WORKER:%s] Task claimed: msg_id=%s url=%s depth=%d retry=%d",
+            worker_id,
+            message_id,
+            url,
+            depth,
+            retry_count,
+        )
+
+        # --- Gate 1: Global Deduplication -----------------------------------
+        url_hash: str = get_fingerprint(url)
+        already_visited: bool = bool(await redis.sismember(SET_VISITED, url_hash))
+
+        if already_visited:
+            log.info(
+                "[WORKER:%s] [DEDUP] Already visited -- XACK and skip: %s",
+                worker_id,
+                url,
+            )
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+            continue
+
+        lock_key: str = f"lock:processing:{url_hash}"
+        lock_acquired: bool = bool(await redis.set(lock_key, "1", ex=600, nx=True))
+
+        if not lock_acquired:
+            log.info(
+                "[WORKER:%s] [DEDUP] Currently being processed by another worker -- "
+                "XACK and skip: %s",
+                worker_id,
+                url,
+            )
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+            continue
+
+        # --- Gate 2: Depth --------------------------------------------------
+        if depth > MAX_DEPTH:
+            log.info(
+                "[WORKER:%s] [DEPTH] depth=%d > MAX_DEPTH=%d -- dropping: %s",
+                worker_id,
+                depth,
+                MAX_DEPTH,
+                url,
+            )
+            await redis.delete(lock_key)
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+            continue
+
+        # --- Gate 3: Global Budget Ticket Dispenser -------------------------
+        # is_first_attempt is keyed on throttle_count, not retry_count, so
+        # that throttle-cycled tasks cannot bypass the budget check.
+        is_first_attempt: bool = (
+            retry_count == 0
+            and int(task_fields.get("throttle_count", "0")) == 0
+        )
+
+        if GLOBAL_MAX_PAGES > 0 and is_first_attempt:
+            current_tickets: int = int(
+                await redis.get("global_budget:tickets_dispensed") or 0
+            )
+            if current_tickets >= GLOBAL_MAX_PAGES:
+                log.info(
+                    "[WORKER:%s] [GLOBAL BUDGET] Limit reached (%d/%d) -- "
+                    "dropping task and deleting lock: %s",
+                    worker_id,
+                    current_tickets,
+                    GLOBAL_MAX_PAGES,
+                    url,
+                )
+                await redis.delete(lock_key)
+                await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+                continue
+
+            ticket_number: int = await redis.incr("global_budget:tickets_dispensed")
+            log.debug(
+                "[WORKER:%s] [GLOBAL BUDGET] Ticket #%d dispensed for: %s",
+                worker_id,
+                ticket_number,
+                url,
+            )
+
+        # --- Gate 4: Domain Throttle ----------------------------------------
+        domain_slot_acquired: bool = False
+        slot_denied: bool = False
+        try:
+            domain_slot_acquired = await acquire_domain_slot(redis, domain)
+        except Exception as exc:
+            log.warning(
+                "[WORKER:%s] [THROTTLE] Domain slot acquire failed (%s) -- "
+                "proceeding without throttle for %s.",
+                worker_id,
+                exc,
+                domain,
+            )
+            domain_slot_acquired = True  # Fail open: don't freeze the crawl
+
+        if not domain_slot_acquired:
+            throttle_count: int = int(task_fields.get("throttle_count", "0")) + 1
+            log.info(
+                "[WORKER:%s] [THROTTLE] Domain '%s' at capacity -- "
+                "re-queuing (throttle #%d): %s",
+                worker_id,
+                domain,
+                throttle_count,
+                url,
+            )
+            await redis.delete(lock_key)
+
+            throttle_payload: Dict[str, str] = dict(task_fields)
+            throttle_payload["retry_count"] = str(
+                max(1, int(task_fields.get("retry_count", "0")))
+            )
+            throttle_payload["throttle_count"] = str(throttle_count)
+
+            await redis.xadd(STREAM_TASKS, throttle_payload)
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+
+            await asyncio.sleep(2.0)
+            slot_denied = True
+
+        if slot_denied:
+            continue
+
+        # --- Gates 5 & 6: Per-run cap + Spider (inside try/finally) ---------
+        try:
+            # Gate 5: Per-process page cap
+            if MAX_PAGES_PER_RUN > 0 and pages_processed >= MAX_PAGES_PER_RUN:
+                log.warning(
+                    "[WORKER:%s] [BUDGET] MAX_PAGES_PER_RUN=%d reached -- "
+                    "re-queuing task and stopping.",
+                    worker_id,
+                    MAX_PAGES_PER_RUN,
+                )
+                await redis.xadd(STREAM_TASKS, task_fields)
+                break
+
+            # Gate 6: Spider execution
+            await _run_spider(
+                redis=redis,
+                worker_id=worker_id,
+                url=url,
+                domain=domain,
+                depth=depth,
+            )
+
+            # Marked visited only after a successful fetch so failures remain retryable.
+            await redis.sadd(SET_VISITED, url_hash)
+            pages_processed += 1
+
+            log.info(
+                "[WORKER:%s] Successfully processed page #%d: %s",
+                worker_id,
+                pages_processed,
+                url,
+            )
+
+        except Exception as exc:
+            log.error(
+                "[WORKER:%s] Spider error for %s: %s: %s",
+                worker_id,
+                url,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                log.error(
+                    "[WORKER:%s] [DLQ] retry_count=%d >= MAX_RETRIES=%d "
+                    "for %s -- routing to DLQ.",
+                    worker_id,
+                    retry_count,
+                    MAX_RETRIES,
+                    url,
+                )
+                await _route_to_dlq(
+                    redis,
+                    task_fields,
+                    f"spider_error: {type(exc).__name__}: {exc}",
+                    log=log,
+                )
+            else:
+                log.warning(
+                    "[WORKER:%s] Re-queuing %s (retry %d/%d).",
+                    worker_id,
+                    url,
+                    retry_count,
+                    MAX_RETRIES - 1,
+                )
+                retry_payload: Dict[str, str] = {
+                    "url": url,
+                    "depth": str(depth),
+                    "retry_count": str(retry_count),
+                    "domain": domain,
+                    "published_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                }
+                await redis.xadd(STREAM_TASKS, retry_payload)
+
+        finally:
+            if domain_slot_acquired and not slot_denied:
+                try:
+                    await release_domain_slot(redis, domain)
+                except Exception as exc:
+                    log.warning(
+                        "[WORKER:%s] [THROTTLE] Domain slot release failed: %s",
+                        worker_id,
+                        exc,
+                    )
+
+            await redis.delete(lock_key)
+
+            await redis.xack(STREAM_TASKS, CONSUMER_GROUP, message_id)
+            log.debug(
+                "[WORKER:%s] XACK: %s (message_id=%s)",
+                worker_id,
+                url,
+                message_id,
+            )
+
+
+async def _run_spider(
+    redis: aioredis.Redis,
+    worker_id: str,
+    url: str,
+    domain: str,
+    depth: int,
+) -> None:
+    """
+    Instantiate ``AuditSpider`` and run it for a single URL.
+
+    Parameters
+    ----------
+    redis:
+        Shared Redis client injected into the spider for stream writes.
+    worker_id:
+        Worker identifier for logging.
+    url:
+        URL to fetch and process.
+    domain:
+        Domain fence for ``allowed_domains``.
+    depth:
+        Hop depth from the seed URL.
+    """
+    log.info("[WORKER:%s] Running spider for: %s (depth=%d)", worker_id, url, depth)
+
+    spider = AuditSpider(
+        redis_client=redis,
+        task_depth=depth,
+        task_domain=domain,
+    )
+    spider.start_urls = [url]
+    spider.allowed_domains = {domain}
+
+    items_yielded: int = 0
+    async for _item in spider.stream():
+        items_yielded += 1
+
+    try:
+        session_manager = getattr(spider, "_session_manager", None)
+        if session_manager is not None:
+            await session_manager.close()
+    except Exception as _sm_exc:
+        log.warning(
+            "[WORKER:%s] SessionManager close error for %s: %s",
+            worker_id,
+            url,
+            _sm_exc,
+        )
+    finally:
+        del spider
+
+    log.info(
+        "[WORKER:%s] Spider finished for %s -- %d item(s) yielded to Scrapling.",
+        worker_id,
+        url,
+        items_yielded,
+    )
 
 
 async def main() -> None:
     """
-    Async entry point – runs the AuditSpider via ``spider.stream()``.
+    Async entry point.
 
-    Execution sequence
-    ------------------
-    1. Configure the spider with the target URL and domain fence.
-    2. Open the output JSONL file in append mode so partial runs survive.
-    3. Iterate ``async for item in spider.stream()`` – this drives the
-       Crawler Engine, which in turn manages sessions, concurrency, the
-       scheduler, and blocked-request retries.
-    4. Write each yielded item as a single UTF-8 JSON line to the file.
-    5. Log real-time statistics after every item.
-    6. On completion, log final crawl statistics.
-
-    Error handling
-    --------------
-    ``KeyboardInterrupt`` is caught so that a ``Ctrl+C`` during the stream
-    produces a clean log entry rather than an ugly traceback.  The Spider
-    base class handles its own graceful shutdown internally.
-
-    Any other exception propagating out of the stream is logged at CRITICAL
-    level with a full traceback before the process exits.
+    Creates the shared Redis pool, ensures the consumer group exists, then
+    launches ``WORKER_COUNT`` concurrent worker coroutines via
+    ``asyncio.gather()``.
     """
     log.info("=" * 70)
-    log.info("Enterprise AI Audit Crawler – Phase 1 Execution Engine")
+    log.info("Enterprise AI Audit Crawler -- Distributed Worker")
     log.info("=" * 70)
-    log.info("Target URL:    %s", TARGET_URL)
-    log.info("Target domain: %s", TARGET_DOMAIN)
-    log.info("Output file:   %s", OUTPUT_PATH)
-    log.info("Log file:      %s", LOG_FILE_PATH)
+    log.info("Redis URL:        %s", settings.REDIS_URL)
+    log.info("Worker count:     %d", WORKER_COUNT)
+    log.info("Max depth:        %d", MAX_DEPTH)
+    log.info("Max Pages Crawl:  %d", GLOBAL_MAX_PAGES)
+    log.info("Max pages/run:    %d", MAX_PAGES_PER_RUN)
+    log.info("Log file:         %s", LOG_FILE_PATH)
     log.info("=" * 70)
 
-    # -------------------------------------------------------------------
-    # Spider instantiation
-    # -------------------------------------------------------------------
-    # We dynamically override the class-level start_urls and allowed_domains
-    # so this main.py can be configured without editing spider.py.
-    AuditSpider.start_urls = [TARGET_URL]
-    AuditSpider.allowed_domains = {TARGET_DOMAIN}
-
-    spider = AuditSpider()
-
-    # -------------------------------------------------------------------
-    # Output file setup
-    # -------------------------------------------------------------------
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Open in append mode – if the file already exists from a previous run,
-    # new items are added after existing ones rather than overwriting.
-    items_written: int = 0
-
-    log.info("Opening output file (append mode): %s", OUTPUT_PATH)
+    redis: aioredis.Redis = create_redis_pool(max_connections=WORKER_COUNT * 5)
 
     try:
-        # anyio.open_file gives us an async file handle so we can write
-        # without blocking the event loop on disk I/O.
-        async with await anyio.open_file(
-            OUTPUT_PATH, mode="a", encoding="utf-8"
-        ) as out_file:
-            log.info("Spider stream starting…")
+        await ensure_consumer_group(redis)
+        log.info(
+            "[BOOTSTRAP] Consumer group '%s' ready on '%s'.",
+            CONSUMER_GROUP,
+            STREAM_TASKS,
+        )
 
-            # ---------------------------------------------------------------
-            # CRITICAL: Use spider.stream(), NOT spider.start()
-            # ---------------------------------------------------------------
-            # ``stream()`` is an async generator.  Each yielded value is a
-            # validated, non-empty item dict (after on_scraped_item() ran).
-            # The generator drives the entire Crawler Engine internally.
-            async for item in spider.stream():
-                item_with_meta: Dict[str, Any] = _enrich_item(
-                    item, items_written)
+        worker_coroutines = [
+            worker_loop(worker_id=f"{CONTAINER_ID}-worker-{i}", redis=redis)
+            for i in range(WORKER_COUNT)
+        ]
 
-                # Serialise to a single JSON line and write immediately.
-                # ``ensure_ascii=False`` preserves international characters.
-                json_line: str = json.dumps(item_with_meta, ensure_ascii=False)
-                await out_file.write(json_line + "\n")
-
-                # Flush after every write so the file is never stale on disk.
-                await out_file.flush()
-
-                items_written += 1
-
-                # Real-time progress log.
-                _log_progress(spider, item_with_meta, items_written)
+        log.info("[BOOTSTRAP] Launching %d worker(s)...", WORKER_COUNT)
+        await asyncio.gather(*worker_coroutines)
 
     except KeyboardInterrupt:
-        # The user pressed Ctrl+C.  The spider handles graceful shutdown
-        # internally via its signal handler.  We just log and exit cleanly.
-        log.warning("KeyboardInterrupt received – crawl interrupted.")
+        log.warning("KeyboardInterrupt received -- shutting down workers.")
 
-    except Exception as exc:  # pragma: no cover
-        log.critical(
-            "Unhandled exception in main execution loop: %s",
-            exc,
-            exc_info=True,
-        )
+    except Exception as exc:
+        log.critical("Unhandled exception in main: %s", exc, exc_info=True)
         raise
 
     finally:
-        # Final statistics summary – available even if the crawl was interrupted.
-        _log_final_stats(spider, items_written)
+        await redis.aclose()
+        log.info("[SHUTDOWN] Redis connection pool closed.")
 
-
-# ===========================================================================
-# Helper functions
-# ===========================================================================
-
-
-def _enrich_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
-    """
-    Add pipeline-level metadata to a scraped item before writing.
-
-    We do not modify the canonical keys (``url``, ``extracted_json_state``,
-    ``extracted_markdown``) – those are the contract.  Instead we inject
-    metadata under an ``_meta`` key so the data fields remain unambiguous.
-
-    Parameters
-    ----------
-    item:
-        The raw item dict from the spider.
-    index:
-        Zero-based item index in the current run (for ordering).
-
-    Returns
-    -------
-    dict
-        Item with ``_meta`` block appended.
-    """
-    import datetime
-
-    enriched = dict(item)
-    enriched["_meta"] = {
-        "item_index": index,
-        "scraped_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
-        "spider_name": "audit_spider",
-    }
-    return enriched
-
-
-def _log_progress(spider: AuditSpider, item: Dict[str, Any], count: int) -> None:
-    """
-    Emit a real-time progress log entry after each item is written.
-
-    Parameters
-    ----------
-    spider:
-        The running spider – used to read live stats.
-    item:
-        The item that was just written.
-    count:
-        Number of items written so far (1-based at call time).
-    """
-    url = item.get("url", "<unknown>")
-    has_json = bool(item.get("extracted_json_state"))
-    has_md = bool(item.get("extracted_markdown", "").strip())
-    extraction_type = "JSON" if has_json else (
-        "Markdown" if has_md else "EMPTY")
-
-    stats = getattr(spider, "stats", None)
-    requests_count = getattr(stats, "requests_count", "?")
-    blocked_count = getattr(stats, "blocked_requests_count", "?")
-
-    log.info(
-        "[ITEM #%d] %s | Type: %s | Total requests: %s | Blocked: %s",
-        count,
-        url,
-        extraction_type,
-        requests_count,
-        blocked_count,
-    )
-
-
-def _log_final_stats(spider: AuditSpider, items_written: int) -> None:
-    """
-    Emit a final summary of crawl statistics when the run completes.
-
-    Parameters
-    ----------
-    spider:
-        The spider instance (may have exited stream already).
-    items_written:
-        Total items successfully written to the output file.
-    """
-    # spider.stats is a property that raises RuntimeError (not AttributeError)
-    # when accessed after the stream has ended.  getattr's default only catches
-    # AttributeError, so we must use an explicit try/except here.
-    try:
-        stats = spider.stats
-    except RuntimeError:
-        stats = None
-    log.info("=" * 70)
-    log.info("CRAWL COMPLETE")
-    log.info("Items written to %s: %d", OUTPUT_PATH, items_written)
-    if stats:
-        log.info(
-            "Total requests made:          %s", getattr(
-                stats, "requests_count", "?")
-        )
-        log.info(
-            "Failed requests:              %s",
-            getattr(stats, "failed_requests_count", "?"),
-        )
-        log.info(
-            "Blocked requests (total):     %s",
-            getattr(stats, "blocked_requests_count", "?"),
-        )
-        log.info(
-            "Offsite requests filtered:    %s",
-            getattr(stats, "offsite_requests_count", "?"),
-        )
-        log.info(
-            "Items scraped (spider):       %s", getattr(
-                stats, "items_scraped", "?")
-        )
-        log.info(
-            "Items dropped (spider):       %s", getattr(
-                stats, "items_dropped", "?")
-        )
-        log.info(
-            "Response bytes received:      %s", getattr(
-                stats, "response_bytes", "?")
-        )
-        elapsed = getattr(stats, "elapsed_seconds", None)
-        if elapsed is not None:
-            log.info("Elapsed time:                 %.1f seconds", elapsed)
-        rps = getattr(stats, "requests_per_second", None)
-        if rps is not None:
-            log.info("Throughput:                   %.2f req/s", rps)
-    log.info("=" * 70)
-
-
-# ===========================================================================
-# Entry point
-# ===========================================================================
 
 if __name__ == "__main__":
-    """
-    Run the audit crawler from the command line:
-
-        cd scrapling
-        .\\venv\\Scripts\\python.exe -m app.main
-
-    Or from outside the scrapling directory:
-
-        python -m app.main
-
-    ``anyio.run()`` selects the asyncio backend by default.  On Windows,
-    replace with ``winloop.run(main())`` once winloop is installed for a
-    performance boost.
-    """
     anyio.run(main)

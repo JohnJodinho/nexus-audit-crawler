@@ -3,76 +3,83 @@ app/logger.py
 =============
 Centralised logging configuration for the Enterprise AI Audit Crawler.
 
-Architecture note
------------------
-Scrapling v0.4 spiders manage their own ``self.logger`` instance.  The spider
-will automatically create the log directory and attach a ``FileHandler`` when
-the ``log_file`` class attribute is set on the Spider subclass.  This module
-therefore has two responsibilities:
+Provides:
+- ``LOG_FILE_PATH``: canonical log path used by the Spider's ``log_file`` attribute.
+- ``attach_file_handler()``: wires a FileHandler onto any logger.
+- ``get_pipeline_logger()``: multi-sink factory that routes logs to three
+  distinct files by component prefix.
 
-1.  Expose the **canonical log-file path** as a single source-of-truth
-    constant (``LOG_FILE_PATH``) so that spider.py and main.py both agree on
-    where logs land.
-
-2.  Provide ``attach_file_handler()`` – a helper that wires a plain
-    ``logging.FileHandler`` onto *any* standard Python logger (e.g. the
-    ``main.py`` root logger) so that top-level asyncio errors and pipeline
-    events are also captured in the same file.
+Log sinks
+---------
+crawler_errors.log  WARNING+  no filter     all components
+worker_system.log   INFO+     audit_crawler worker-loop events only
+spider_activity.log INFO+     audit_spider  spider-level events only
 """
 
 import logging
 import pathlib
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+_APP_DIR = pathlib.Path(__file__).parent
+_LOG_DIR = _APP_DIR / "logs"
 
-# All log output – spider events, block events, pipeline errors – is funnelled
-# into this single file.  Using a path relative to this module's parent keeps
-# the project self-contained and avoids hardcoded absolute paths.
-_APP_DIR = pathlib.Path(__file__).parent        # …/scrapling/app/
-LOG_FILE_PATH: str = str(_APP_DIR / "logs" / "crawler.log")
+LOG_FILE_PATH: str = str(_LOG_DIR / "crawler.log")
 
-# Human-readable format that matches the spider's default template,
-# but also prefixes the logger name so entries from main.py are distinct.
 LOG_FORMAT: str = "[%(asctime)s]:(%(name)s) %(levelname)s: %(message)s"
 LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 
 
-# ---------------------------------------------------------------------------
-# Public helpers
-# ---------------------------------------------------------------------------
+class ComponentFilter(logging.Filter):
+    """Allow only records whose ``record.name`` starts with ``prefix``."""
+
+    def __init__(self, prefix: str) -> None:
+        super().__init__()
+        self._prefix = prefix
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name.startswith(self._prefix)
+
+
+def _make_file_handler(
+    filename: str,
+    level: int,
+    component_filter: "ComponentFilter | None" = None,
+) -> logging.FileHandler:
+    """Create a FileHandler for ``_LOG_DIR/filename`` at ``level``, with an optional filter."""
+    log_path = _LOG_DIR / filename
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    if component_filter is not None:
+        handler.addFilter(component_filter)
+    return handler
+
 
 def attach_file_handler(
     logger: logging.Logger,
     level: int = logging.DEBUG,
 ) -> logging.FileHandler:
     """
-    Attach a ``FileHandler`` to *logger* that writes to ``LOG_FILE_PATH``.
+    Attach a FileHandler writing to ``LOG_FILE_PATH`` to ``logger``.
 
-    The parent directories are created automatically (mirrors what the Spider
-    class does internally).  Calling this on the same logger multiple times is
-    safe – the function is idempotent; it skips adding a new handler if an
-    equivalent ``FileHandler`` is already attached.
+    Idempotent: skips attachment if an equivalent handler already exists.
 
     Parameters
     ----------
     logger:
-        Any ``logging.Logger`` instance – typically the ``__name__``-based
-        logger created in ``main.py``.
+        Target logger.
     level:
-        Minimum severity to record to file.  Defaults to ``DEBUG`` so nothing
-        is silently swallowed.
+        Minimum severity level for the handler.
 
     Returns
     -------
     logging.FileHandler
-        The handler that was attached (or found already attached).
+        The attached (or existing) handler.
     """
     log_path = pathlib.Path(LOG_FILE_PATH)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Idempotency guard – don't attach a second FileHandler for the same path.
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
             if pathlib.Path(handler.baseFilename).resolve() == log_path.resolve():
@@ -88,39 +95,69 @@ def attach_file_handler(
 
 def get_pipeline_logger(name: str = "audit_crawler.pipeline") -> logging.Logger:
     """
-    Return a named logger configured for pipeline-level events.
+    Return a named logger wired to three file sinks and a console handler.
 
-    This logger writes to both the console (INFO and above) and the shared
-    log file (DEBUG and above).  Use it in ``main.py`` for all asyncio loop
-    and file I/O events that happen *outside* the Spider class.
+    Also wires the ``spider_activity.log`` sink directly to the
+    ``audit_spider`` logger so that records emitted by ``self.logger``
+    inside ``AuditSpider`` are captured without relying on propagation.
 
     Parameters
     ----------
     name:
-        Logger name.  Using a dotted-namespace keeps it distinct from the
-        Scrapling internal loggers (``scrapling.spiders.*``).
+        Logger name, e.g. ``"audit_crawler.main"``.
+
+    Returns
+    -------
+    logging.Logger
+        Configured logger; idempotent on repeated calls.
     """
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
 
-    # Avoid duplicate handlers if this is called more than once.
     if logger.handlers:
         return logger
 
     formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    # Console handler – INFO+ only, keeps the terminal readable.
-    # stdout/stderr are reconfigured to UTF-8 in main.py before any logger
-    # is constructed, so this plain StreamHandler is safe for Unicode output.
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(formatter)
     logger.addHandler(console)
 
-    # File handler – DEBUG+, full verbosity in the log file.
-    attach_file_handler(logger, level=logging.DEBUG)
+    logger.addHandler(
+        _make_file_handler("crawler_errors.log", level=logging.WARNING)
+    )
+    logger.addHandler(
+        _make_file_handler(
+            "worker_system.log",
+            level=logging.INFO,
+            component_filter=ComponentFilter("audit_crawler"),
+        )
+    )
 
-    # Do not propagate to the root logger to prevent double-printing.
+    spider_activity_handler = _make_file_handler(
+        "spider_activity.log",
+        level=logging.INFO,
+        component_filter=ComponentFilter("audit_spider"),
+    )
+    logger.addHandler(spider_activity_handler)
+
+    # Fix: also attach spider_activity.log directly to the spider's own logger.
+    # self.logger inside AuditSpider is a separate Logger instance named
+    # "audit_spider" (derived from spider.name).  Records it emits never flow
+    # through this logger, so the ComponentFilter above never sees them.
+    # Attaching the handler directly ensures spider events are captured.
+    spider_logger = logging.getLogger("audit_spider")
+    spider_logger.setLevel(logging.DEBUG)
+    if not any(
+        isinstance(h, logging.FileHandler)
+        and pathlib.Path(h.baseFilename).name == "spider_activity.log"
+        for h in spider_logger.handlers
+    ):
+        spider_logger.addHandler(
+            _make_file_handler("spider_activity.log", level=logging.INFO)
+        )
+
     logger.propagate = False
 
     return logger

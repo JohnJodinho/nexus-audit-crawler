@@ -1,16 +1,36 @@
-MarkItDown_README.md
-spiders_*.md
+# Virtual Environment
 venv/
 
+# Environment Secrets
+.env
+.env.*
+!.env.example
+
+# Python Cache
 __pycache__/
+*.pyc
 
-.scrapling_cache/ 
+# Framework Caches
+.pytest_cache/
+.scrapling_cache/
 
+# Application Logs & Outputs
 app/logs/*.log
-
-app/logs/*.jsonl 
-
+app/logs/*.txt
+app/logs/*.jsonl
 app/output.jsonl
-app/async_gens.py
-app/scripts
-app/crawlers
+misc/
+*.json
+*.jsonl
+
+# Specific outputs
+audit_results.json
+audit_results_dups.json
+audit_tasks.json
+audit_tasks_dups.json
+final_data.json
+
+# Documentation
+MarkItDown_README.md
+redis_implementation_guide.md
+spiders_*.md
