@@ -1163,3 +1163,253 @@ Before implementing Claude's higher-level GraphRAG ideas, make the current crawl
 **tests → atomic budget → PEL recovery → canonical URLs → crawl namespacing → durable persistence → crawl lifecycle → audit signals → graph → query/RAG.**
 
 That ordering minimizes rework and ensures every later layer is built on reliable crawl data rather than on today's Redis-only, single-crawl assumptions.
+
+---
+
+# 25. Forensic Agent Review — Additional Findings
+
+A second forensic review was performed against the same implementation after the repo-aware plan above was written. Its findings are incorporated here as **implementation-level P0/P1 corrections**, not as a replacement for the broader roadmap.
+
+The review confirms the existing architecture and identifies four additional reliability defects that must be fixed before the crawler is treated as production-safe. fileciteturn20file0L114-L153
+
+## 25.1 P0 — Guaranteed cleanup of Playwright/session resources
+
+`_run_spider()` currently closes the spider session only after successful completion of the async stream. If `spider.stream()` raises, control jumps to the worker exception handler before the cleanup code executes. This can leak browser contexts/processes and eventually exhaust worker memory. fileciteturn20file0L137-L150
+
+### Required implementation
+
+Change the lifecycle to:
+
+```python
+session_manager = None
+try:
+    async for _item in spider.stream():
+        ...
+finally:
+    session_manager = getattr(spider, "_session_manager", None)
+    if session_manager is not None:
+        await session_manager.close()
+```
+
+Also test successful completion, HTTP failure, Playwright navigation timeout, browser/page crash, proxy failure, and extraction exception.
+
+**Acceptance criterion:** no browser/session resource remains open after `_run_spider()` returns or raises.
+
+## 25.2 P1 — Fix page-cap requeue semantics and budget accounting
+
+When `MAX_PAGES_PER_RUN` is reached, the task is requeued without incrementing `throttle_count`. The task can subsequently look like a first attempt and consume another page-budget ticket. fileciteturn20file0L169-L171
+
+### Required implementation
+
+Do not treat a worker-local page-cap deferral as a fresh first attempt.
+
+Preferred task semantics:
+
+```text
+task:
+    retry_count
+    throttle_count
+    budget_reserved
+```
+
+If the page has already reserved a global ticket, the requeued task must carry that state rather than acquire another ticket.
+
+The key invariant is:
+
+> **One logical page attempt consumes at most one global page ticket.**
+
+Add a concurrency test with multiple workers repeatedly hitting the local page cap and verify the global ticket count.
+
+## 25.3 P1 — Make domain-slot acquisition atomic and crash-safe
+
+The current domain semaphore performs `INCR`, checks the result, then potentially `DECR`. A crash window can leave the counter elevated, and the TTL is established only after the threshold check. fileciteturn20file0L173-L182
+
+### Required implementation
+
+Replace the application-level sequence with one Redis Lua operation:
+
+```text
+if current < limit:
+    INCR
+    EXPIRE
+    return acquired
+else:
+    return rejected
+```
+
+The script must guarantee no counter overshoot, TTL on every successful acquisition, no mutation on rejection, and no negative counter on release.
+
+## 25.4 P2 — Remove or explicitly repurpose the dead TelemetrySink
+
+`TelemetrySink` is not used by the active crawler path; `spider.py` writes drop events directly to Redis. fileciteturn20file0L151-L153
+
+Keep `DropReason` as the canonical vocabulary, then either remove `TelemetrySink` or explicitly document it as an optional local/debug sink and add a real call site.
+
+Preferred production architecture:
+
+```text
+spider → Redis telemetry stream → telemetry consumer / durable sink
+```
+
+## 25.5 P2 — Protect the MarkItDown conversion boundary
+
+The review flags the module-level `_MARKITDOWN` singleton because `run_triple_threat()` executes in a thread pool. Multiple worker threads can therefore call the same converter concurrently. fileciteturn20file0L189-L194
+
+Treat this as a risk to verify with a dependency-level concurrency test rather than assuming thread-unsafety. Prefer a thread-local instance or per-conversion instance, depending on measured initialization cost.
+
+## 25.6 P2 — Canonical URL normalization
+
+The review confirms that `get_fingerprint()` currently hashes only a trailing-slash-normalized URL. fileciteturn20file0L195-L200
+
+Separate:
+
+```python
+canonicalize_url(url) -> str
+get_fingerprint(canonical_url) -> str
+```
+
+rather than putting URL semantics inside the hash function.
+
+## 25.7 P2 — Remove the unused `trafilatura` import
+
+`find_dups.py` imports `trafilatura.deduplication` without using it, while `trafilatura` is not declared in `requirements.txt`. fileciteturn20file0L202-L205
+
+Remove the import and align duplicate detection with the canonical URL/fingerprint implementation.
+
+# 26. Revised P0/P1 Execution Order
+
+## P0 — Fix before adding new architecture
+
+1. Repair `tests/smoke_test.py`.
+2. Establish pytest-based regression tests.
+3. Fix PEL stale-task recovery.
+4. Fix atomic global budget reservation.
+5. Fix `_run_spider()` cleanup with `finally`.
+6. Centralize URL canonicalization.
+7. Namespace Redis keys with `crawl_id`.
+8. Make flush operations crawl-scoped.
+
+## P1 — Concurrency correctness
+
+9. Fix page-cap requeue/ticket semantics.
+10. Replace domain semaphore with atomic Lua acquire/release.
+11. Add concurrency tests for budget, domain slots, locks, and queue recovery.
+12. Add result schema versioning.
+13. Introduce durable Postgres persistence.
+14. Add crawl lifecycle/completion state.
+
+## P2 — Extraction/runtime hardening
+
+15. Resolve MarkItDown thread-safety through a concurrency test and thread-local/per-call instantiation.
+16. Remove or explicitly repurpose `TelemetrySink`.
+17. Remove unused `trafilatura` import.
+
+## Then proceed to product expansion
+
+18. Screenshots/accessibility/SEO signals.
+19. Sectionization.
+20. Embeddings/entities/graph.
+21. Extractive summaries.
+22. GitHub Actions matrix.
+23. Query API.
+24. Lazy LLM/RAG.
+25. Audit reporting/UI.
+
+# 27. Forensic Acceptance Tests
+
+Before Phase 2 durable persistence begins, the following tests should pass.
+
+### Queue recovery
+
+```text
+worker A receives task
+worker A dies
+        ↓
+janitor detects stale PEL
+        ↓
+task reclaimed
+        ↓
+task requeued
+        ↓
+worker B receives task
+```
+
+### Budget correctness
+
+```text
+N workers
+M concurrent pages
+GLOBAL_MAX_PAGES = K
+
+assert total logical page tickets <= K
+```
+
+### Domain throttle correctness
+
+```text
+N workers
+same domain
+MAX_CONCURRENT_PER_DOMAIN = K
+
+assert active domain slots <= K
+assert counter eventually returns to 0
+assert TTL exists while slot is held
+```
+
+### Browser cleanup
+
+```text
+spider.stream() succeeds → session closed
+spider.stream() raises   → session closed
+```
+
+### Page-cap behavior
+
+```text
+worker page cap reached
+        ↓
+task deferred
+        ↓
+task resumes elsewhere
+        ↓
+no second global ticket charged
+```
+
+### Canonicalization
+
+At minimum, the equivalence rules for these URLs must be explicitly defined and tested:
+
+```text
+https://EXAMPLE.com
+https://example.com/
+https://example.com#section
+https://example.com:443/
+```
+
+# 28. Overall Forensic Assessment
+
+The second review does **not** invalidate the previous architecture plan. It strengthens the case for the same central strategy:
+
+> **Do not add GraphRAG, Postgres, GitHub Actions matrices, or an LLM query layer until the existing Redis crawler is concurrency-correct and failure-safe.**
+
+The highest-value immediate work is now clearly bounded to the crawler reliability layer:
+
+```text
+PEL recovery
+    +
+atomic budget
+    +
+browser cleanup
+    +
+domain semaphore
+    +
+page-ticket accounting
+    +
+canonical URLs
+    +
+crawl namespacing
+    +
+regression tests
+```
+
+Once these invariants are enforced, the existing crawler becomes a much safer foundation for the durable persistence and intelligent audit layers described in the earlier phases.
