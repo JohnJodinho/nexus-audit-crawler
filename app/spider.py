@@ -4,9 +4,9 @@ app/spider.py
 ``AuditSpider`` -- single-page fetcher for the Enterprise AI Audit Crawler.
 
 Fetches one URL per instantiation.  Discovered links are published directly
-to ``stream:audit_tasks``; extraction results to ``stream:audit_results``;
-drop events to ``stream:dropped_telemetry``.  No crawl state is held on the
-instance; all shared state lives in Redis.
+to the crawl-scoped task stream; extraction results to the results stream;
+drop events to the telemetry stream.  No crawl state is held on the instance;
+all shared state lives in Redis.
 
 Sessions
 --------
@@ -41,8 +41,21 @@ from scrapling.spiders import Request, Response, SessionManager, Spider
 from app.extraction import run_triple_threat
 from app.logger import LOG_FILE_PATH
 from app.telemetry import DropReason
-from app.redis_client import STREAM_TASKS, STREAM_RESULTS, STREAM_TELEMETRY
-from app.utils.utilities import get_fingerprint
+from app.redis_client import (
+    tasks_key,
+    results_key,
+    telemetry_key,
+    queued_key,
+)
+from app.utils.contacts import (
+    extract_contacts_from_text,
+    validate_email,
+    validate_phone,
+)
+from app.utils.utilities import canonicalize_url, get_fingerprint
+from app.utils.audits import compile_full_audit
+from app.utils.screenshots import capture_stitched_screenshot
+from app.storage.appwrite_client import storage_client
 from app.config import settings
 
 
@@ -115,6 +128,7 @@ class AuditSpider(Spider):
         self,
         *,
         redis_client: aioredis.Redis,
+        crawl_id: str,
         task_depth: int = 0,
         task_domain: str = "",
         **kwargs: Any,
@@ -124,6 +138,9 @@ class AuditSpider(Spider):
         ----------
         redis_client:
             Shared async Redis connection pool from the worker loop.
+        crawl_id:
+            The crawl namespace identifier — used to build crawl-scoped
+            Redis key names.
         task_depth:
             Crawl depth of this page from the seed URL.
         task_domain:
@@ -131,6 +148,7 @@ class AuditSpider(Spider):
         """
         super().__init__(**kwargs)
         self._redis: aioredis.Redis = redis_client
+        self._crawl_id: str = crawl_id
         self._task_depth: int = task_depth
         self._task_domain: str = task_domain
 
@@ -166,12 +184,12 @@ class AuditSpider(Spider):
 
         stealth_kwargs: dict = {
             "headless":          True,
-            "block_webrtc":      True,   # Prevent real IP leak through proxy
-            "hide_canvas":       True,   # Prevent hardware canvas fingerprinting
-            "disable_resources": True,   # Block media/images/fonts for speed
-            "network_idle":      True,   # Wait for XHR/fetch to quiesce (SPA support)
-            "google_search":     True,   # Set Google as referer (organic traffic)
-            "timeout":           60_000,
+            "block_webrtc":      True,
+            "hide_canvas":       True,
+            "disable_resources": True,
+            "network_idle":      False,
+            "google_search":     True,
+            "timeout":           30_000,
             "retries":           2,
         }
 
@@ -191,17 +209,7 @@ class AuditSpider(Spider):
         manager.add(self._SID_STEALTH, stealth_session, lazy=True)
 
     async def is_blocked(self, response: Response) -> bool:
-        """
-        Return ``True`` if the response is a bot-detection challenge or block.
-
-        Checks HTTP status code against ``_BLOCKED_STATUS_CODES``, then scans
-        the first 8 KiB of the body for known challenge fingerprints.
-
-        Parameters
-        ----------
-        response:
-            The ``Response`` object to inspect.
-        """
+        """Return ``True`` if the response is a bot-detection challenge or block."""
         if response.status in _BLOCKED_STATUS_CODES:
             self.logger.warning(
                 "[BLOCKED] HTTP %d detected for %s – will pivot to stealth.",
@@ -231,24 +239,7 @@ class AuditSpider(Spider):
     async def retry_blocked_request(
         self, request: Request, response: Response
     ) -> Request:
-        """
-        Pivot a blocked request to the stealth Playwright session.
-
-        Clears stale proxy kwargs from the original request so the stealth
-        session's ``ProxyRotator`` can assign a fresh residential proxy.
-
-        Parameters
-        ----------
-        request:
-            A copy of the original blocked request.
-        response:
-            The blocked response (available for inspection).
-
-        Returns
-        -------
-        Request
-            The mutated request routed to ``_SID_STEALTH``.
-        """
+        """Pivot a blocked request to the stealth Playwright session."""
         self.logger.info(
             "[RETRY] Pivoting blocked URL %s -> session '%s'.",
             request.url,
@@ -269,8 +260,9 @@ class AuditSpider(Spider):
         Main parsing callback.
 
         Evaluates each discovered href through five sequential gates and
-        publishes qualifying links to ``stream:audit_tasks``.  Runs the
-        Triple-Threat extraction pipeline and yields the canonical payload.
+        publishes qualifying links to the crawl-scoped task stream.  Runs the
+        cumulative Triple-Threat extraction pipeline and yields the canonical
+        payload.
 
         Gates
         -----
@@ -278,18 +270,8 @@ class AuditSpider(Spider):
         2. Contact interception / scheme check (mailto:, tel:, non-HTTP).
         2.5. Domain fence (must match ``task_domain`` exactly or as subdomain).
         3. Deny list (``DENY_PATTERN``).
-        4. Atomic discovery ledger (``SADD set:queued_fingerprints``).
-        5. Accept -- ``XADD stream:audit_tasks``.
-
-        Parameters
-        ----------
-        response:
-            The ``Response`` object for the current page.
-
-        Yields
-        ------
-        dict
-            The canonical extraction payload.
+        4. Atomic discovery ledger (``SADD crawl:{id}:set:queued_fingerprints``).
+        5. Accept -- ``XADD crawl:{id}:stream:audit_tasks``.
         """
         self.logger.info(
             "[PARSE] Processing (depth=%d): %s (HTTP %d)",
@@ -305,6 +287,9 @@ class AuditSpider(Spider):
         links_found: int = 0
         links_queued: int = 0
 
+        _now = lambda: datetime.datetime.now(datetime.UTC).isoformat()
+        _telemetry_stream = telemetry_key(self._crawl_id)
+
         for href in response.css("a::attr(href)").getall():
             if not href:
                 continue
@@ -316,7 +301,7 @@ class AuditSpider(Spider):
             except ValueError:
                 continue
 
-                # Gate 1: per-page duplicate
+            # Gate 1: per-page duplicate
             if abs_url in page_seen_urls:
                 self.logger.debug("[GATE-1] PAGE-DUPLICATE: %s", abs_url)
                 continue
@@ -329,22 +314,20 @@ class AuditSpider(Spider):
             if raw_lower.startswith("mailto:"):
                 try:
                     raw_email: str = href[len("mailto:"):].split("?")[0]
-                    clean_email: str = unquote(raw_email).strip()
+                    clean_email: Optional[str] = validate_email(raw_email)
                 except Exception:
-                    clean_email = ""
+                    clean_email = None
 
                 if clean_email:
                     page_emails.add(clean_email)
-                    self.logger.debug(
-                        "[GATE-2/CONTACT] Email extracted: %s", clean_email
-                    )
+                    self.logger.debug("[GATE-2/CONTACT] Email extracted: %s", clean_email)
 
                 await self._redis.xadd(
-                    STREAM_TELEMETRY,
+                    _telemetry_stream,
                     {
-                        "timestamp_utc": datetime.datetime.now(
-                            datetime.UTC
-                        ).isoformat(),
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
                         "source_url": response.url,
                         "target_url": href,
                         "drop_reason": DropReason.CONTACT_EXTRACTED_EMAIL,
@@ -355,22 +338,20 @@ class AuditSpider(Spider):
             if raw_lower.startswith("tel:"):
                 try:
                     raw_phone: str = href[len("tel:"):]
-                    clean_phone: str = unquote(raw_phone).strip()
+                    clean_phone: Optional[str] = validate_phone(raw_phone)
                 except Exception:
-                    clean_phone = ""
+                    clean_phone = None
 
                 if clean_phone:
                     page_phones.add(clean_phone)
-                    self.logger.debug(
-                        "[GATE-2/CONTACT] Phone extracted: %s", clean_phone
-                    )
+                    self.logger.debug("[GATE-2/CONTACT] Phone extracted: %s", clean_phone)
 
                 await self._redis.xadd(
-                    STREAM_TELEMETRY,
+                    _telemetry_stream,
                     {
-                        "timestamp_utc": datetime.datetime.now(
-                            datetime.UTC
-                        ).isoformat(),
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
                         "source_url": response.url,
                         "target_url": href,
                         "drop_reason": DropReason.CONTACT_EXTRACTED_PHONE,
@@ -385,11 +366,11 @@ class AuditSpider(Spider):
 
             if scheme not in ("http", "https"):
                 await self._redis.xadd(
-                    STREAM_TELEMETRY,
+                    _telemetry_stream,
                     {
-                        "timestamp_utc": datetime.datetime.now(
-                            datetime.UTC
-                        ).isoformat(),
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
                         "source_url": response.url,
                         "target_url": abs_url,
                         "drop_reason": DropReason.INVALID_SCHEME,
@@ -412,11 +393,11 @@ class AuditSpider(Spider):
 
             if not (is_exact_match or is_valid_subdomain):
                 await self._redis.xadd(
-                    STREAM_TELEMETRY,
+                    _telemetry_stream,
                     {
-                        "timestamp_utc": datetime.datetime.now(
-                            datetime.UTC
-                        ).isoformat(),
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
                         "source_url": response.url,
                         "target_url": abs_url,
                         "drop_reason": "OFFSITE_DOMAIN",
@@ -428,11 +409,11 @@ class AuditSpider(Spider):
             # Gate 3: deny list
             if DENY_PATTERN.search(parsed_url.path):
                 await self._redis.xadd(
-                    STREAM_TELEMETRY,
+                    _telemetry_stream,
                     {
-                        "timestamp_utc": datetime.datetime.now(
-                            datetime.UTC
-                        ).isoformat(),
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
                         "source_url": response.url,
                         "target_url": abs_url,
                         "drop_reason": DropReason.DENY_LIST,
@@ -441,10 +422,10 @@ class AuditSpider(Spider):
                 self.logger.debug("[GATE-3/DENY] %s", abs_url)
                 continue
 
-            # Gate 4: atomic discovery ledger -- SADD returns 1 if newly added, 0 if seen
+            # Gate 4: atomic discovery ledger
             abs_url_hash: str = get_fingerprint(abs_url)
             is_new_discovery: int = await self._redis.sadd(
-                "set:queued_fingerprints", abs_url_hash
+                queued_key(self._crawl_id), abs_url_hash
             )
             if not is_new_discovery:
                 self.logger.debug(
@@ -460,13 +441,16 @@ class AuditSpider(Spider):
                 abs_url,
             )
             await self._redis.xadd(
-                STREAM_TASKS,
+                tasks_key(self._crawl_id),
                 {
+                    "schema_version": "1",
+                    "crawl_id": self._crawl_id,
                     "url": abs_url,
                     "depth": str(self._task_depth + 1),
                     "retry_count": "0",
+                    "throttle_count": "0",
                     "domain": self._task_domain,
-                    "published_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                    "published_at": _now(),
                 },
             )
 
@@ -479,14 +463,69 @@ class AuditSpider(Spider):
         )
 
         loop = asyncio.get_event_loop()
-        payload: Dict[str, Any] = await loop.run_in_executor(
+        extraction: Dict[str, Any] = await loop.run_in_executor(
             None, run_triple_threat, response, self.logger
         )
 
-        payload["contacts"] = {
+        # Extract plain text contacts from rendered Markdown
+        raw_md: str = extraction.get("raw_markdown", "") or ""
+        text_contacts = extract_contacts_from_text(raw_md)
+        page_emails.update(text_contacts["emails"])
+        page_phones.update(text_contacts["phones"])
+
+        extraction["contacts"] = {
             "emails": sorted(page_emails),
             "phones": sorted(page_phones),
         }
+
+        # -------------------------------------------------------------------
+        # Phase 3: Comprehensive Enterprise Audit & Quality Signals
+        # -------------------------------------------------------------------
+        canonical_url = canonicalize_url(response.url)
+        headers_dict: Dict[str, str] = {}
+        if hasattr(response, "headers") and response.headers:
+            try:
+                headers_dict = dict(response.headers)
+            except Exception:
+                headers_dict = {}
+
+        html_text = ""
+        try:
+            if hasattr(response, "text") and response.text:
+                html_text = str(response.text)
+            elif hasattr(response, "body") and response.body:
+                html_text = response.body.decode("utf-8", errors="replace")
+        except Exception:
+            html_text = ""
+
+        audit_metadata = compile_full_audit(
+            html_text=html_text,
+            headers=headers_dict,
+            canonical_url=canonical_url,
+            markdown_text=raw_md,
+            request_url=response.url,
+            response_time_ms=0.0,
+        )
+        extraction["metadata"] = audit_metadata
+
+        # -------------------------------------------------------------------
+        # Optional Screenshot via Playwright & Appwrite
+        # -------------------------------------------------------------------
+        screenshot_file_id: Optional[str] = None
+        if settings.SCREENSHOT_ENABLED and hasattr(response, "page") and response.page is not None:
+            try:
+                shot_bytes = await capture_stitched_screenshot(response.page)
+                if shot_bytes:
+                    fingerprint = get_fingerprint(canonical_url)
+                    screenshot_file_id = await storage_client.upload_screenshot(
+                        crawl_id=self._crawl_id,
+                        fingerprint=fingerprint,
+                        image_bytes=shot_bytes,
+                    )
+            except Exception as shot_exc:
+                self.logger.warning("[SCREENSHOT] Screenshot capture failed for %s: %s", response.url, shot_exc)
+
+        extraction["screenshot_file_id"] = screenshot_file_id
 
         if page_emails or page_phones:
             self.logger.info(
@@ -496,31 +535,22 @@ class AuditSpider(Spider):
                 sorted(page_phones) if page_phones else "(none)",
             )
 
-        yield payload
+        yield extraction
 
     async def on_scraped_item(self, item: Dict[str, Any]) -> Dict[str, Any] | None:
         """
-        Validate and publish each scraped item to ``stream:audit_results``.
+        Validate and publish each scraped item to the crawl-scoped results stream.
 
-        An item is accepted if at least one of ``extracted_json_state`` or
-        ``extracted_markdown`` is non-empty.  Empty items indicate all three
-        extraction strategies failed and are silently dropped.
-
-        Parameters
-        ----------
-        item:
-            The canonical payload dictionary from ``parse()``.
-
-        Returns
-        -------
-        dict | None
-            The item unchanged if valid, or ``None`` to drop it.
+        An item is accepted if ``raw_markdown`` is non-empty OR at least one
+        JSON extraction strategy produced output.  Items where all three
+        strategies returned empty results are dropped.
         """
         url: str = item.get("url", "<unknown>")
-        has_json: bool = bool(item.get("extracted_json_state"))
-        has_markdown: bool = bool(item.get("extracted_markdown", "").strip())
+        has_xhr: bool = bool(item.get("xhr_payloads"))
+        has_hydration: bool = bool(item.get("hydration_state"))
+        has_markdown: bool = bool(item.get("raw_markdown", "").strip())
 
-        if not has_json and not has_markdown:
+        if not has_xhr and not has_hydration and not has_markdown:
             self.logger.warning(
                 "[PIPELINE] DROP -- no data extracted for %s. "
                 "All three strategies returned empty results.",
@@ -528,33 +558,37 @@ class AuditSpider(Spider):
             )
             return None
 
-        extraction_method = "XHR/Hydration JSON" if has_json else "MarkItDown Markdown"
+        extraction_methods = item.get("extraction_methods", ["none"])
         self.logger.info(
             "[PIPELINE] ACCEPT -- item from %s via %s.",
             url,
-            extraction_method,
+            ", ".join(extraction_methods),
         )
 
         redis_payload: Dict[str, str] = {
+            "schema_version": "1",
+            "crawl_id": self._crawl_id,
             "url": url,
-            "extracted_json_state": json.dumps(
-                item.get("extracted_json_state", {}), ensure_ascii=False
-            ),
-            "extracted_markdown": item.get("extracted_markdown", ""),
+            "xhr_payloads": json.dumps(item.get("xhr_payloads", []), ensure_ascii=False),
+            "hydration_state": json.dumps(item.get("hydration_state"), ensure_ascii=False),
+            "raw_markdown": item.get("raw_markdown", ""),
+            "extraction_methods": json.dumps(extraction_methods),
             "contacts": json.dumps(
                 item.get("contacts", {"emails": [], "phones": []}),
                 ensure_ascii=False,
             ),
+            "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False),
+            "screenshot_file_id": item.get("screenshot_file_id") or "",
             "scraped_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "depth": str(self._task_depth),
             "domain": self._task_domain,
         }
 
         try:
-            msg_id: str = await self._redis.xadd(STREAM_RESULTS, redis_payload)
+            msg_id: str = await self._redis.xadd(results_key(self._crawl_id), redis_payload)
             self.logger.info(
                 "[REDIS] Result pushed to %s: url=%s msg_id=%s",
-                STREAM_RESULTS,
+                results_key(self._crawl_id),
                 url,
                 msg_id,
             )
@@ -569,16 +603,7 @@ class AuditSpider(Spider):
         return item
 
     async def on_error(self, request: Request, error: Exception) -> None:
-        """
-        Log unhandled request exceptions.
-
-        Parameters
-        ----------
-        request:
-            The ``Request`` object that caused the error.
-        error:
-            The exception raised.
-        """
+        """Log unhandled request exceptions."""
         self.logger.error(
             "[ERROR] Request FAILED for %s (session=%s): %s: %s",
             request.url,
@@ -591,10 +616,11 @@ class AuditSpider(Spider):
     async def on_start(self, resuming: bool = False) -> None:
         """Log spider startup."""
         self.logger.info(
-            "[LIFECYCLE] Spider '%s'. Seed: %s | depth=%d",
+            "[LIFECYCLE] Spider '%s'. Seed: %s | depth=%d | crawl_id=%s",
             self.name,
             ", ".join(self.start_urls),
             self._task_depth,
+            self._crawl_id,
         )
 
     async def on_close(self) -> None:

@@ -252,6 +252,80 @@ Initial rules should include:
 
 Do **not** blindly sort or discard arbitrary query strings because they may identify different resources.
 
+### 2.6 Fix Playwright session manager leak
+
+`_run_spider()` in `main.py` places `session_manager.close()` in a plain `try` block *after* the `spider.stream()` loop.  If `spider.stream()` raises any unhandled exception (Playwright navigation timeout, proxy reset, target crash), execution jumps directly to the outer `except` in `worker_loop` and `session_manager.close()` is never called.  Leaked Playwright contexts and Chromium child processes accumulate until the process is OOM-killed.
+
+Wrap the spider invocation in a `try...finally` block that unconditionally calls `session_manager.close()`.
+
+### 2.7 Fix per-worker-cap double-billing
+
+When Gate 5 (`MAX_PAGES_PER_RUN`) is reached, the task is re-queued via `XADD` with its payload unchanged: `retry_count` and `throttle_count` both remain 0.  The next worker evaluates `is_first_attempt = True` and purchases a second global budget ticket for a page that was already counted in Gate 3.
+
+Before calling `XADD`, increment `throttle_count` by 1 in the re-queued payload so that the budget gate's `is_first_attempt` guard correctly identifies the re-queued task as having already been billed.
+
+### 2.8 Resolve MarkItDown singleton thread-safety
+
+`_MARKITDOWN = MarkItDown(enable_plugins=False)` is a module-level singleton in `extraction.py`.  `spider.py` dispatches `run_triple_threat` via `loop.run_in_executor(None, ...)`, which routes it to the default `ThreadPoolExecutor`.  Multiple threads can therefore call `_MARKITDOWN.convert_stream()` concurrently on the same instance.
+
+Verify thread-safety from the `markitdown` library's documentation and source.  If mutable state exists inside the converter, instantiate `MarkItDown` per-call inside `extract_via_markitdown()` rather than sharing a global instance.
+
+### 2.9 Redesign extraction from winner-takes-all to cumulative
+
+The current `run_triple_threat()` in `extraction.py` short-circuits on the first successful strategy: if XHR JSON wins, Hydration and MarkItDown are skipped entirely.  This design assumes the three strategies are **substitutes**.  They are not — they are **complements** that serve different downstream consumers:
+
+- **XHR / Hydration JSON** → structured fact extraction, pricing intelligence, knowledge graph nodes, structured API data.
+- **MarkItDown** → full-text representation needed for embeddings, page section splitting, TextRank summaries, SEO audit signals (H1 count, heading hierarchy, meta description, content length, image alt coverage).
+
+A Next.js pricing page that succeeds on Hydration currently produces JSON but **no Markdown** — meaning it can never be sectioned or embedded in Phase 5.  This is a permanent data loss.
+
+Replace the short-circuit waterfall with a cumulative runner:
+
+```python
+def run_triple_threat(response, logger):
+    # Always attempt all three — no early exits
+    xhr_state      = extract_from_xhr(captured_xhr, logger)      # fast, pure Python
+    hydration_state = extract_from_hydration(html_str, logger)   # fast, regex
+    raw_markdown    = extract_via_markitdown(raw_bytes, logger)   # CPU-bound, in executor
+
+    return {
+        "url":              url,
+        "xhr_state":        xhr_state,        # None if no relevant XHR captured
+        "hydration_state":  hydration_state,  # None if no hydration block found
+        "raw_markdown":     raw_markdown or "",  # Always attempted
+        "extraction_method": _determine_methods(xhr_state, hydration_state, raw_markdown),
+    }
+```
+
+`_determine_methods()` returns a list (e.g. `["hydration", "markitdown"]`) rather than a single winner string.  Update `on_scraped_item()` to store all three fields separately and drop only if `raw_markdown` is empty **and** both JSON fields are `None` (true empty response).
+
+Update the result payload schema, the Postgres `pages` schema (`json_state jsonb` already added; `hydration_state jsonb` should be added), and all downstream references in `on_scraped_item()` and `persist_consumer.py`.
+
+### 2.10 Replace the XHR relevance allow-list with a tracking deny-list
+
+`_XHR_RELEVANCE_KEYS` in `extraction.py` is a narrow frozenset of assumed business keys (`"pricing"`, `"products"`, `"team"`, etc.) originally written for B2B SaaS company sites.  It is wrong for a general-purpose audit crawler:
+
+- **False negatives**: A real estate site's `"listings"`, a healthcare site's `"doctors"`, a retail site's `"inventory"` — all useful, all silently rejected.
+- **Wrong abstraction**: The filter was designed to answer "is this XHR good enough to be our only result?" (winner-takes-all logic).  Under the new cumulative design that question is gone entirely.
+
+Replace with a **URL-pattern deny-list** that rejects known analytics and tracking requests, and accept all other structured JSON:
+
+```python
+_XHR_TRACKING_DENY_PATTERNS: tuple[str, ...] = (
+    "google-analytics", "googletagmanager", "doubleclick",
+    "hotjar", "segment.io", "mixpanel", "amplitude",
+    "sentry", "datadog", "newrelic",
+    "facebook.com/tr", "bat.bing", "clarity.ms",
+    "analytics.", ".tracking.", "beacon", "telemetry", "pixel",
+)
+```
+
+Acceptance criteria for an XHR response:
+1. Request URL does not match any deny pattern.
+2. Response is a JSON object (dict) with at least 2 keys (filters `{"ok": true}` heartbeats).
+
+Collect **all accepted responses**, not just the first.  Store the list in `xhr_state` in the result payload.  Phase 5 (NER, knowledge graph) decides at analysis time which payloads are semantically useful — that decision does not belong at capture time.
+
 ---
 
 # 3. Phase 1 — Multi-Crawl Namespacing
@@ -334,17 +408,29 @@ python -m app.orchestrator --flush-all
 
 Do not let a normal developer typo erase every active crawl.
 
+The crawl-scoped flush implementation must also sweep:
+
+- `crawl:{id}:lock:processing:*` — release processing locks left by dead workers;
+- `crawl:{id}:throttle:domain:*` — reset domain concurrency counters so new workers are not throttled by stale state.
+
+The existing `flush_crawler_state` sweeps these patterns globally; the crawl-scoped refactor must preserve both sweeps using the `crawl:{id}:` prefix.
+
 ---
 
-# 4. Phase 2 — Durable Crawl State
+# 4. Phase 2 — Durable Crawl State & Dual-Tier Storage
 
 **Priority: P0**
 
-Introduce Supabase Postgres as the system of record.
+Introduce a high-performance **dual-tier storage architecture**:
+1. **System of Record & Relational Metadata**: Supabase Postgres (crawls, page metadata, contacts, link graph, telemetry, audit logs, DLQ).
+2. **Blob & Unstructured Artifact Storage**: Appwrite Storage Buckets (`APP_WRITE_BUCKET_ID`) for large Markdown documents, raw HTML dumps, and screenshot images.
 
-## 4.1 Core schema
+### Why Dual-Tier Separation?
+- **Postgres Lean Performance**: Storing large text blobs and binary screenshots in Postgres bloats the WAL (Write-Ahead Logging), increases table I/O cache pressure, and degrades B-Tree indexing.
+- **Cost & Capacity**: Blob storage in Appwrite provides scalable capacity for heavy artifacts without straining the database connection pool.
+- **Pointers in Postgres**: Postgres stores the `markdown_file_id`, `markdown_byte_size`, and short summaries, while full documents stream directly from Appwrite.
 
-Start smaller than the earlier plan:
+## 4.1 Core Schema
 
 ```sql
 crawls (
@@ -360,21 +446,28 @@ crawls (
     pages_failed integer default 0,
     config jsonb,
     error text
-)
+);
 
 pages (
     id bigserial primary key,
-    crawl_id uuid not null references crawls(id),
+    crawl_id uuid not null references crawls(id) on delete cascade,
     url text not null,
     canonical_url text not null,
     path text,
     status_code integer,
-    extraction_method text,
-    raw_markdown text,
+    extraction_methods text[],
+    markdown_file_id text,          -- Appwrite Storage Bucket file ID
+    markdown_byte_size integer,     -- Size in bytes of the uploaded markdown
+    markdown_token_count integer,   -- Estimated token count for LLM budgeting
+    summary text,                   -- Optional extractive summary for quick search
+    json_state jsonb,
+    hydration_state jsonb,
+    xhr_payloads jsonb,
+    screenshot_file_id text,        -- Appwrite Storage Bucket file ID for screenshots
     fetched_at timestamptz,
     metadata jsonb,
     unique (crawl_id, canonical_url)
-)
+);
 
 page_contacts (
     id bigserial primary key,
@@ -406,29 +499,36 @@ audit_events (
 
 Only after this is stable should the system add sections/entities/embeddings.
 
-## 4.2 Idempotent persistence
+## 4.2 Idempotent Dual-Tier Persistence
 
-The consumer must tolerate duplicate delivery.
-
-Use `crawl_id + canonical_url` as the page idempotency key.
-
-Persistence should be:
+The persistence consumer (`app/persistence_worker.py`) consumes from `crawl:{id}:stream:audit_results`:
 
 ```text
-Redis result
-   ↓
-validate schema
-   ↓
-UPSERT page
-   ↓
-UPSERT contacts
-   ↓
-UPSERT discovered links
-   ↓
-XACK only after transaction succeeds
+Redis Result Stream
+       ↓
+Validate Schema (version=1)
+       ↓
+Upload Markdown Blob → Appwrite Storage Bucket ({crawl_id}/{fingerprint}.md)
+       ↓
+Begin Postgres Transaction
+       ↓
+UPSERT page record with markdown_file_id pointer (ON CONFLICT (crawl_id, canonical_url) DO UPDATE)
+       ↓
+UPSERT page_contacts
+       ↓
+UPSERT page_links
+       ↓
+UPDATE crawls statistics (pages_processed = pages_processed + 1)
+       ↓
+Commit Postgres Transaction
+       ↓
+XACK Redis message
 ```
 
-If Postgres fails, the Redis message must remain retryable.
+### Crash & Failure Guarantees
+- If Appwrite upload fails: transaction is not opened, Redis message is NOT acknowledged; task is re-delivered via PEL.
+- If Postgres fails: Appwrite file is overwritten idempotently on next retry, transaction rolls back, Redis message is NOT acknowledged.
+- `XACK` happens **only** after both Appwrite storage and Postgres transaction succeed.
 
 ## 4.3 Result schema versioning
 
@@ -438,132 +538,176 @@ Future changes should use explicit versions rather than making the persistence c
 
 ---
 
-# 5. Phase 3 — Capture Real Audit Signals During Fetch
+# 5. Phase 3 — Enterprise Audit Signals & Quality Metrics (Per Page)
 
 **Priority: P1**
 
-Do not turn the crawler into a full Lighthouse replacement. Capture high-value signals that naturally fit the existing render.
+Capture high-value, industry-standard audit signals across HTTP, security, indexability, structured semantic data, and runtime performance without paying the latency/memory overhead of a full Lighthouse run.
 
-## 5.1 Screenshot
-
-Add an optional full-page screenshot for successful Playwright/stealth fetches.
-
-Store the object in Supabase Storage and persist only the object key/URL in Postgres.
-
-Make screenshots configurable:
-
-```text
-SCREENSHOT_ENABLED=false
-SCREENSHOT_FULL_PAGE=true
-```
-
-because screenshots can materially increase bandwidth and storage.
-
-## 5.2 Accessibility
-
-Use `axe-core` only when a Playwright page is available.
-
-Persist normalized findings:
-
-```json
-{
-  "rule_id": "...",
-  "impact": "serious",
-  "description": "...",
-  "help_url": "...",
-  "nodes": 3
-}
-```
-
-Do not store a giant unstructured axe payload as the only representation.
-
-## 5.3 HTML/SEO structural signals
-
-Derive from the fetched DOM/Markdown:
-
-- title present/missing;
-- meta description present/missing;
-- H1 count;
-- heading hierarchy;
-- canonical URL;
-- robots directives;
-- image alt coverage;
-- internal/external link counts;
-- broken internal links when status information is available;
-- content length;
-- indexability indicators.
-
-## 5.4 Performance
-
-Treat Lighthouse as optional.
-
-Start with inexpensive browser/network measurements: response duration, time to first byte if available, DOM/content readiness, transferred bytes, request count, and basic Core Web Vitals where the browser/runtime exposes them reliably.
-
-A separate Lighthouse pass should be introduced only if its accuracy/value justifies the extra page cost.
+All extracted audit metrics are structured and persisted directly into PostgreSQL `pages.metadata` (`JSONB`).
 
 ---
 
-# 6. Phase 4 — Crawl Completion and Consolidation
+## 5.1 Tier 1: HTTP & Security Audits (Raw Fetch Tier — Zero Latency)
+Extracted during the fast `FetcherSession` stage directly from `response.headers`:
+
+* **HTTP Security Headers:** Inspect headers for `Strict-Transport-Security` (HSTS), `Content-Security-Policy` (CSP), `X-Frame-Options`, `X-Content-Type-Options`, and `Referrer-Policy`. Flag missing or insecure directives.
+* **`X-Robots-Tag` Resolution & Reconciliation:** Capture header-level indexing directives and reconcile them with HTML `<meta name="robots">` tags to flag conflicting directives (e.g. header says `noindex` but HTML says `index`).
+* **Cookie Security Attributes:** Parse `Set-Cookie` headers for missing `Secure`, `HttpOnly`, and `SameSite` flags.
+* **Transport Compression:** Verify `Content-Encoding` (`br`, `gzip`, `zstd`) to flag uncompressed text/asset transfers.
+
+---
+
+## 5.2 Tier 2: Structured Data & Indexability (Extraction Tier)
+Extracted directly during HTML/DOM parsing, feeding directly into downstream Knowledge Graph pipelines in Phase 5:
+
+* **JSON-LD & Schema.org Payloads:** Extract all `<script type="application/ld+json">` blocks. Store parsed JSON objects in `pages.metadata` (e.g., `Organization`, `Product`, `Person`, `LocalBusiness`, `FAQPage`, `BreadcrumbList`) — providing 100% accurate structured entity nodes without expensive LLM extraction.
+* **Canonical URL Conflict Detection:** Compare the page's requested URL against its self-declared `<link rel="canonical">` and `canonicalize_url()` output. Flag `matches`, `cross_domain`, `mismatched_path`, or `missing`.
+* **Hreflang & Multi-Region Alternate Tags:** Extract `<link rel="alternate" hreflang="...">` tags to check for missing self-referential tags, invalid language/region ISO codes, and missing `x-default`.
+* **Content Metrics & Thin Content Detection:** Compute raw word count, character count, and code-to-text ratio directly from the generated `raw_markdown` to detect doorway or thin-content pages.
+* **Heading & Image Alt Hierarchy:** Single H1 presence, heading depth progression (H1 $\rightarrow$ H2 $\rightarrow$ H3), and image `alt` attribute coverage ratio.
+
+---
+
+## 5.3 Tier 3: Runtime Diagnostics & Adaptive Page Settle (The "Settle Shield")
+When a page escalates to Playwright stealth rendering, capture lightweight native browser diagnostics with an intelligent, non-blocking settle mechanism:
+
+* **Why Unconditional `networkidle` Hangs:**
+  Modern websites frequently run long-polling WebSockets (chat widgets like Intercom, Crisp) and endless analytics beacons (Google Analytics, Hotjar, Sentry, Facebook Pixel) sending heartbeat pings every few seconds. Unconditional `networkidle` waits for "0 active network connections for 500ms", which **never resolves** on such pages, causing the browser to hang for 30–60 seconds.
+
+* **The "Settle Shield" Architecture:**
+  1. **Tracking & Telemetry Abort:** Intercept and abort known analytics, advertising, and chat beacon requests (`google-analytics`, `hotjar`, `sentry.io`, `doubleclick`, `facebook.net`). This eliminates 90% of infinite polling connections.
+  2. **Bounded Network Idle Race:** Navigate on `wait_until="domcontentloaded"` (or `"load"`), then perform an optional non-blocking settle race:
+     ```python
+     try:
+         await page.wait_for_load_state("networkidle", timeout=settings.NETWORK_IDLE_TIMEOUT_MS)
+     except Exception:
+         pass  # Proceed immediately if background long-polling persists past timeout
+     ```
+     If the page settles in 200ms, it completes in 200ms. If an infinite stream exists, it hard-caps the wait at 3,000ms and proceeds without stalling!
+  3. **Configurable Settings in `.env`:**
+     - `NETWORK_IDLE_TIMEOUT_MS: int = 3000` (Max wait cap for network settle; never blocks indefinitely).
+     - `PAGE_SETTLE_DELAY_MS: int = 0` (Optional post-load delay in ms, useful for heavy client-side React/Vue SPAs).
+* **Console & Runtime JS Exceptions:** Log unhandled client-side JavaScript crashes and failed resource fetches.
+* **Pre-JS vs. Post-JS DOM Mutation:** Compare raw HTML title/canonical/meta tags against the hydrated DOM state to flag client-side scripts overwriting SEO tags post-render.
+* **Lightweight Navigation Timing:** Inject `window.performance.getEntriesByType("navigation")[0]` via Playwright to extract First Contentful Paint (FCP), DOM Interactive, and DOM Complete in milliseconds without running Lighthouse.
+
+---
+
+## 5.4 Tier 4: Advanced Screenshot Engine (PIL Vertical Stitching & Blob Storage)
+When `SCREENSHOT_ENABLED=true` in Playwright stealth sessions:
+
+* **The Virtual DOM Unmounting Problem:** Standard `page.screenshot(full_page=True)` resizes the virtual viewport, causing virtualized lists (e.g. `react-virtualized`, `react-window`) to unmount offscreen components and producing blank sections. It also duplicates sticky headers across tall pages.
+* **Incremental Scrolling & Lazy-Load Triggering:**
+  1. Programmatically scroll the page in viewport increments (`window.scrollBy(0, viewport_height)`).
+  2. Sleep briefly (100–200ms) to trigger `IntersectionObserver` lazy images and ensure virtualized DOM nodes mount.
+  3. Temporarily hide duplicate `position: fixed` / sticky header elements on subsequent slices.
+* **In-Memory PIL (Pillow) Vertical Stitching:**
+  - Capture individual viewport screenshot slices (`page.screenshot()`).
+  - Stitch slices vertically in memory using Pillow (`PIL.Image.new('RGB', (w, total_h))`).
+  - Compress as optimized PNG/WebP and upload bytes directly to **Appwrite Storage Bucket** (`nexus-audit-7637-ncx90`).
+* **PostgreSQL Pointer:** Store only the returned `screenshot_file_id` in Postgres `pages.screenshot_file_id`.
+
+---
+
+## 5.5 Heavy State Decoupling (The 16 KB Rule to Prevent Postgres TOAST Bloat)
+To keep PostgreSQL `pages` table lean, fast, and cache-friendly (< 2 KB per row) and prevent heavy TOAST table thrashing:
+
+* **Hydration State (`__NEXT_DATA__`, `__NUXT__`)**: If the serialized JSON exceeds **16 KB**, upload the raw JSON to Appwrite Storage as `{crawl_id}/{fingerprint}_hydration.json`. In Postgres, store `hydration_file_id` pointer + high-level boolean/summary.
+* **Intercepted XHR Dumps**: If raw XHR responses exceed **16 KB**, upload to Appwrite as `{crawl_id}/{fingerprint}_xhr.json`, keeping only the endpoint status summary and `xhr_file_id` pointer in Postgres.
+* **JSON-LD Schema Dumps**: Extract schema types (`["Organization", "FAQPage"]`) and primary entity metadata into Postgres `pages.metadata` for instant SQL indexing; offload oversized raw payloads (> 16 KB) to Appwrite.
+
+---
+
+## 5.6 `pages.metadata` JSONB Schema Specification
+
+```json
+{
+  "security": {
+    "missing_headers": ["Content-Security-Policy", "Strict-Transport-Security"],
+    "insecure_cookies": ["session_id: missing Secure flag"],
+    "compression": "br",
+    "protocol": "HTTP/2"
+  },
+  "seo": {
+    "title": "Aetna Health Insurance Plans",
+    "title_length": 30,
+    "meta_description": "Explore health insurance options...",
+    "declared_canonical": "https://www.aetna.com/",
+    "canonical_status": "matches_url",
+    "x_robots_tag": null,
+    "meta_robots": "index, follow",
+    "headings": {
+      "h1_count": 1,
+      "h1_texts": ["Health insurance made easy"],
+      "heading_order_valid": true
+    },
+    "images": {
+      "total": 14,
+      "missing_alt": 2
+    },
+    "hreflang": [{"lang": "en-US", "href": "https://www.aetna.com/"}],
+    "word_count": 482,
+    "character_count": 3210,
+    "json_ld_schemas": [
+      {"@type": "Organization", "name": "Aetna", "url": "https://www.aetna.com"}
+    ]
+  },
+  "runtime": {
+    "response_time_ms": 142.5,
+    "fcp_ms": 420.5,
+    "dom_interactive_ms": 780.2,
+    "js_errors": []
+  }
+}
+```
+
+---
+
+# 6. Phase 4 — Crawl Lifecycle State Machine & Consolidation Engine
 
 **Priority: P0/P1**
 
-This is a missing architectural layer in the original plan.
-
-A crawl needs an explicit state machine:
+Manages the full lifecycle state machine of a crawl and executes domain-level aggregation and consolidation once traversal finishes.
 
 ```text
 created
   ↓
-seeding
+running (workers & persistence active)
   ↓
-running
+draining (task stream empty, PEL resolving)
   ↓
-draining
-  ↓
-persisting
-  ↓
-consolidating
+consolidating (graph & quality rollup execution)
   ↓
 finished
 ```
 
-Failure states:
+Failure states: `failed`, `cancelled`, `timed_out`.
 
-```text
-failed
-cancelled
-timed_out
-```
+---
 
-## 6.1 Completion conditions
-
-Do not rely on GitHub Actions job completion alone.
-
+## 6.1 Completion Watchdog Conditions (Janitor in `orchestrator.py`)
 A crawl is ready for consolidation only when:
+1. Redis task stream has no pending work (`XPENDING` / stream length == 0);
+2. Worker PELs are empty across all consumers;
+3. Active processing locks (`crawl:{id}:lock:processing:*`) are zero;
+4. Persistence consumer lag is zero (`results`, `telemetry`, `dlq` streams acknowledged);
+5. Crawl budget is exhausted OR link traversal is naturally complete.
 
-1. no new tasks are being generated;
-2. Redis task stream has no available work;
-3. worker PELs are empty;
-4. active processing locks are zero;
-5. persistence consumer lag is zero;
-6. no unrecovered task remains;
-7. crawl budget is either exhausted or traversal is naturally complete.
+---
 
-## 6.2 Counters
+## 6.2 Crawl Consolidation & Site-Wide Quality Rollup (`app/consolidation.py`)
+When the watchdog triggers the `consolidating` state, it executes an atomic aggregation over the crawl's persisted records:
 
-Track:
-
-```text
-discovered
-queued
-processing
-processed
-failed
-dlq
-persisted
-```
-
-These can live in Redis during the run and be finalized in Postgres.
+1. **Volume & Coverage Metrics:** Total pages discovered, successfully processed, failed in DLQ, and dropped by telemetry filters.
+2. **Contact Graph Rollup:** Unique deduplicated emails and phone numbers discovered across the entire crawl.
+3. **Site-Wide SEO & Health Score:**
+   - Percentage of pages with valid H1 and meta description.
+   - Overall image `alt` tag coverage percentage across all pages.
+   - Missing security headers compliance score (HSTS, CSP, etc.).
+4. **Internal Anchor (`#hash`) Verification:**
+   - Evaluates `page_links` containing URL fragments (e.g. `/about#team`) against target page DOM elements or Markdown headings, flagging broken anchor targets.
+5. **State Transition:** Updates `crawls.status = 'finished'`, sets `crawls.finished_at = now()`, and writes the rollup summary into `crawls.config['consolidation']`.
 
 ---
 
@@ -589,6 +733,10 @@ page_sections (
 ```
 
 Split Markdown into meaningful sections rather than embedding an entire page as one vector.
+
+> **Decision checkpoint:** Before generating the Postgres migration for `page_sections`, select the embedding model, verify its output dimension, and hard-code the `vector(N)` value.  The migration must not be committed with `<DIM>` as a placeholder.  The embedding provider, model name, and dimension must be locked in `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSION` before the schema is applied.
+>
+> **Phase 0 dependency:** The Phase 0 extraction redesign (item 2.9) guarantees that `raw_markdown` is always present for every successfully scraped page, regardless of which JSON strategy succeeds.  Phase 5 can therefore assume that every `pages` row has embeddable content available.  Do not build the sectionizer assuming the old fallback-only Markdown behaviour.
 
 ## 7.2 Embeddings
 
@@ -773,7 +921,7 @@ Avoid scattering literal Redis strings throughout the application.
 
 ## 14.1 Page result
 
-Minimum contract:
+Minimum contract (updated for cumulative extraction design from Phase 0):
 
 ```json
 {
@@ -783,15 +931,22 @@ Minimum contract:
   "canonical_url": "...",
   "status_code": 200,
   "depth": 1,
-  "extraction_method": "xhr|hydration|markitdown|none",
-  "extracted_json_state": {},
-  "extracted_markdown": "...",
+  "extraction_methods": ["hydration", "markitdown"],
+  "xhr_state": [{}, {}],
+  "hydration_state": {},
+  "raw_markdown": "...",
   "contacts": {"emails": [], "phones": []},
   "audit": {},
   "screenshot_key": null,
   "fetched_at": "..."
 }
 ```
+
+Key differences from the original contract:
+
+- `extraction_method` (single string) is replaced by `extraction_methods` (list): multiple strategies can succeed simultaneously.
+- `extracted_json_state` (merged single dict) is replaced by `xhr_state` (list of all accepted XHR payloads) and `hydration_state` (single hydration block or null).  This preserves all captured structured data rather than discarding all but the first match.
+- `raw_markdown` is now always present (empty string at minimum); it is never absent from a successful result.
 
 ## 14.2 Telemetry event
 
@@ -829,10 +984,10 @@ Responsibilities:
 
 1. consume result events;
 2. validate the event schema;
-3. persist in a Postgres transaction;
-4. upload binary objects when required;
-5. acknowledge Redis only after durable commit;
-6. retry transient database failures;
+3. upload Markdown text and screenshot objects to Appwrite Storage Bucket;
+4. persist page metadata and storage file IDs in a Postgres transaction;
+5. acknowledge Redis (XACK) only after durable Postgres commit;
+6. retry transient database or storage failures;
 7. expose consumer lag/health;
 8. support graceful shutdown.
 
@@ -999,14 +1154,20 @@ The crawler's existing contact extraction should be treated as client data, not 
 
 ## P0 — Reliability first
 
-1. Repair stale tests.
-2. Add pytest infrastructure.
-3. Fix atomic global budget.
-4. Fix PEL reclaim/requeue semantics.
-5. Centralize URL canonicalization.
-6. Centralize Redis key generation.
-7. Add crawl ID to task/result/telemetry contracts.
-8. Make flush crawl-scoped.
+1. Repair stale tests (`ALLOW_PATTERN` import crash; align with deny-list model).
+2. Add pytest infrastructure (`pytest`, `pytest-asyncio`, Redis/Scrapling fakes).
+3. Fix atomic global budget (replace non-atomic GET→INCR with a Lua script or atomic increment-and-check).
+4. Fix PEL reclaim/requeue semantics (XCLAIM → XADD re-publish + XACK; stale tasks return to `>` delivery path).
+5. Fix Playwright session manager leak (`try...finally` in `_run_spider` so browser is closed on exception).
+6. Fix per-worker-cap double-billing (increment `throttle_count` on `MAX_PAGES_PER_RUN` requeue to prevent double budget ticket).
+7. Verify or fix MarkItDown singleton thread-safety under `ThreadPoolExecutor`.
+8. Centralize URL canonicalization (`canonicalize_url()` used by seed, fingerprints, link discovery, persistence).
+9. Centralize Redis key generation (key functions parameterized by `crawl_id`, not global string constants).
+10. Add `crawl_id` to task, result, telemetry, and DLQ payloads.
+11. Add `schema_version=1` to result, telemetry, and DLQ payloads.
+12. Make flush crawl-scoped (`--flush --crawl-id <id>`; add `--flush-all` for global administrative reset).
+13. Redesign `run_triple_threat()` as cumulative: always run all three strategies, return `xhr_state` (list), `hydration_state`, and `raw_markdown` separately; remove short-circuit exits.
+14. Replace `_XHR_RELEVANCE_KEYS` allow-list with `_XHR_TRACKING_DENY_PATTERNS` URL deny-list; collect all accepted XHR responses (not just the first).
 
 ## P1 — Durable crawler
 
@@ -1042,11 +1203,17 @@ The crawler's existing contact extraction should be treated as client data, not 
 
 ## Phase 0
 
-- [ ] `pytest` passes.
-- [ ] Budget cannot exceed the configured limit under concurrent workers.
-- [ ] A stale PEL task becomes available to workers again.
-- [ ] Locks are scoped and released safely.
-- [ ] Canonical URLs produce deterministic fingerprints.
+- [ ] `pytest` passes with no skipped tests.
+- [ ] Global page budget cannot exceed the configured limit under concurrent workers (verified with a concurrency test).
+- [ ] A stale PEL task is re-published to the task stream via `XADD` and becomes available to healthy workers again.
+- [ ] A Playwright session is unconditionally closed even when `spider.stream()` raises an exception.
+- [ ] A per-run-cap requeue does not consume an additional global budget ticket.
+- [ ] MarkItDown thread-safety is either verified or resolved.
+- [ ] Locks are scoped and released safely under crash simulation.
+- [ ] Canonical URLs produce deterministic fingerprints regardless of scheme casing, trailing slash, default ports, or URL fragment.
+- [ ] Every result, telemetry, and DLQ event carries `crawl_id` and `schema_version`.
+- [ ] Every successfully scraped page result contains a non-empty `raw_markdown` field regardless of which JSON extraction strategy succeeded.
+- [ ] XHR capture collects all non-tracking JSON responses; no site-specific allow-list is applied.
 
 ## Phase 1
 

@@ -1,14 +1,28 @@
 """
 app/extraction.py
 =================
-Triple-Threat extraction pipeline for the Enterprise AI Audit Crawler.
+Cumulative Triple-Threat extraction pipeline for the Enterprise AI Audit Crawler.
 
-Three strategies are applied in waterfall order, each returning ``None`` on
-failure so the next strategy is tried:
+All three strategies run for every page regardless of success or failure.
+Results are accumulated rather than short-circuited so that downstream
+consumers (embeddings, knowledge graph, structured fact extraction) each
+receive the data format they require:
 
-1. XHR Interception       -- parse captured API JSON from Playwright XHR.
-2. Hydration State        -- extract embedded SPA state (Next.js, Nuxt, Remix, etc.).
-3. MarkItDown DOM Fallback -- convert raw HTML to Markdown via ``markitdown``.
+- ``xhr_payloads``      list[dict]      — structured JSON from XHR/fetch calls
+- ``hydration_state``   dict | None     — embedded SPA hydration state
+- ``raw_markdown``      str             — full-text Markdown from the DOM
+
+Strategies
+----------
+1. XHR Capture       — collects all non-tracking JSON responses intercepted by
+                        Playwright.  Filtered by a URL deny-list of known analytics
+                        and tracking endpoints rather than an allow-list of assumed
+                        business keys.
+2. Hydration State   — extracts embedded SPA state (Next.js, Nuxt, Remix, etc.)
+                        via regex patterns on the raw HTML body.
+3. MarkItDown        — converts raw HTML to Markdown.  MarkItDown is instantiated
+                        per-call to avoid shared mutable state under concurrent
+                        ThreadPoolExecutor invocations.
 """
 
 from __future__ import annotations
@@ -22,13 +36,54 @@ from typing import Any, Dict, List, Optional
 from markitdown import MarkItDown
 
 
-_MARKITDOWN = MarkItDown(enable_plugins=False)
+# ---------------------------------------------------------------------------
+# XHR filtering: deny-list approach
+# ---------------------------------------------------------------------------
+
+#: URL substrings that identify analytics, tracking, and telemetry endpoints.
+#: XHR responses whose request URL contains any of these are discarded.
+#: This is intentionally broad — false positives (discarding a legitimate
+#: response) are far less harmful than false negatives (storing tracking noise
+#: in the knowledge graph).
+_XHR_TRACKING_DENY_PATTERNS: tuple[str, ...] = (
+    "google-analytics",
+    "googletagmanager",
+    "doubleclick",
+    "hotjar",
+    "segment.io",
+    "mixpanel",
+    "amplitude",
+    "sentry",
+    "datadog",
+    "newrelic",
+    "facebook.com/tr",
+    "bat.bing",
+    "clarity.ms",
+    "analytics.",
+    ".tracking.",
+    "beacon",
+    "telemetry",
+    "pixel",
+)
+
+_XHR_MIN_KEYS: int = 2  # Reject trivial heartbeat responses: {"ok": true}
+
+
+def _is_tracking_xhr(request_url: str) -> bool:
+    """Return ``True`` if ``request_url`` belongs to a known tracking endpoint."""
+    url_lower = request_url.lower()
+    return any(pattern in url_lower for pattern in _XHR_TRACKING_DENY_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Hydration state patterns
+# ---------------------------------------------------------------------------
 
 _HYDRATION_PATTERNS: List[tuple[str, re.Pattern[str]]] = [
     (
         "__NEXT_DATA__",
         re.compile(
-            r'<script[^>]*id=["|\']__NEXT_DATA__["|\'][^>]*>\s*(\{.*?\})\s*</script>',
+            r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?\})\s*</script>',
             re.DOTALL | re.IGNORECASE,
         ),
     ),
@@ -55,26 +110,23 @@ _HYDRATION_PATTERNS: List[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-_XHR_RELEVANCE_KEYS: frozenset[str] = frozenset(
-    {
-        "title", "name", "description", "content", "text", "body",
-        "pricing", "price", "plan", "feature", "features", "services",
-        "product", "products", "solution", "solutions",
-        "about", "team", "mission", "values",
-        "contact", "email", "phone",
-        "data", "result", "results", "items", "records",
-    }
-)
+
+# ---------------------------------------------------------------------------
+# Extraction functions
+# ---------------------------------------------------------------------------
 
 
 def extract_from_xhr(
     captured_xhr: list,
     logger: Optional[logging.Logger] = None,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """
-    Search captured XHR/fetch responses for a substantive JSON payload.
+    Collect all non-tracking XHR/fetch JSON responses.
 
-    Returns the first response whose keys overlap with ``_XHR_RELEVANCE_KEYS``.
+    Accepts every response whose request URL does not match
+    ``_XHR_TRACKING_DENY_PATTERNS`` and whose body is a JSON object with at
+    least ``_XHR_MIN_KEYS`` keys.  Returns all accepted payloads rather than
+    only the first so that downstream consumers can work with the full set.
 
     Parameters
     ----------
@@ -85,18 +137,27 @@ def extract_from_xhr(
 
     Returns
     -------
-    dict | None
-        First relevant JSON payload, or ``None`` if no match found.
+    list[dict]
+        All accepted structured JSON payloads.  Empty list if none found.
     """
     if not captured_xhr:
         if logger:
             logger.debug("[XHR] No captured XHR responses available.")
-        return None
+        return []
 
     if logger:
         logger.info("[XHR] Scanning %d captured XHR response(s).", len(captured_xhr))
 
+    accepted: List[Dict[str, Any]] = []
+
     for xhr in captured_xhr:
+        request_url: str = getattr(xhr, "url", "") or ""
+
+        if _is_tracking_xhr(request_url):
+            if logger:
+                logger.debug("[XHR] Denied (tracking URL): %s", request_url)
+            continue
+
         payload: Optional[Dict[str, Any]] = None
         try:
             if hasattr(xhr, "json") and callable(xhr.json):
@@ -114,21 +175,19 @@ def extract_from_xhr(
         if not isinstance(payload, dict):
             continue
 
-        all_keys: set[str] = _collect_keys_recursive(payload)
-        matched_keys = all_keys & _XHR_RELEVANCE_KEYS
-        if matched_keys:
-            url_hint = getattr(xhr, "url", "<unknown>")
+        if len(payload) < _XHR_MIN_KEYS:
             if logger:
-                logger.info(
-                    "[XHR] [OK] Found relevant payload at %s (matched keys: %s).",
-                    url_hint,
-                    ", ".join(sorted(matched_keys)),
-                )
-            return payload
+                logger.debug("[XHR] Skipped trivial response (%d keys): %s", len(payload), request_url)
+            continue
+
+        if logger:
+            logger.info("[XHR] Accepted payload from %s (%d root keys).", request_url, len(payload))
+        accepted.append(payload)
 
     if logger:
-        logger.debug("[XHR] No relevant JSON payload found in XHR responses.")
-    return None
+        logger.info("[XHR] %d / %d XHR response(s) accepted.", len(accepted), len(captured_xhr))
+
+    return accepted
 
 
 def extract_from_hydration(
@@ -165,7 +224,7 @@ def extract_from_hydration(
                 if isinstance(payload, dict):
                     if logger:
                         logger.info(
-                            "[HYDRATION] [OK] Extracted '%s' state block (%d keys at root).",
+                            "[HYDRATION] Extracted '%s' state block (%d root keys).",
                             label,
                             len(payload),
                         )
@@ -191,8 +250,9 @@ def extract_via_markitdown(
     """
     Convert raw HTML to Markdown via ``MarkItDown``.
 
-    The full, unmodified HTML is passed verbatim; no pre-processing or pruning
-    is applied before conversion.
+    A fresh ``MarkItDown`` instance is created per call to avoid shared mutable
+    state when this function is dispatched to a ``ThreadPoolExecutor`` by
+    multiple concurrent workers.
 
     Parameters
     ----------
@@ -212,7 +272,8 @@ def extract_via_markitdown(
         return None
 
     try:
-        result = _MARKITDOWN.convert_stream(
+        converter = MarkItDown(enable_plugins=False)
+        result = converter.convert_stream(
             io.BytesIO(raw_html_bytes),
             file_extension=".html",
         )
@@ -225,7 +286,7 @@ def extract_via_markitdown(
 
         if logger:
             logger.info(
-                "[MARKITDOWN] [OK] Converted HTML -> Markdown (%d chars).",
+                "[MARKITDOWN] Converted HTML -> Markdown (%d chars).",
                 len(markdown_text),
             )
         return markdown_text
@@ -240,22 +301,44 @@ def extract_via_markitdown(
         return None
 
 
+def _determine_methods(
+    xhr_payloads: List[Dict[str, Any]],
+    hydration_state: Optional[Dict[str, Any]],
+    raw_markdown: str,
+) -> List[str]:
+    """Return the list of extraction strategies that produced output."""
+    methods: List[str] = []
+    if xhr_payloads:
+        methods.append("xhr")
+    if hydration_state:
+        methods.append("hydration")
+    if raw_markdown.strip():
+        methods.append("markitdown")
+    return methods or ["none"]
+
+
 def run_triple_threat(
     response: Any,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
-    Orchestrate the Triple-Threat extraction waterfall.
+    Orchestrate the cumulative Triple-Threat extraction pipeline.
 
-    Runs XHR → Hydration → MarkItDown in order, short-circuiting on success.
-    Always returns a dict with exactly three keys:
+    All three strategies are attempted for every page.  Results are
+    accumulated rather than short-circuited so that downstream consumers
+    (embeddings, knowledge graph, structured fact extraction) each receive
+    the representation they require.
+
+    Returns a dict with exactly these keys:
 
     .. code-block:: python
 
         {
-            "url":                   str,
-            "extracted_json_state":  dict,
-            "extracted_markdown":    str,
+            "url":              str,
+            "xhr_payloads":     list[dict],   # all non-tracking XHR responses
+            "hydration_state":  dict | None,  # first matched SPA hydration block
+            "raw_markdown":     str,          # full-text Markdown (empty str on failure)
+            "extraction_methods": list[str],  # which strategies produced output
         }
 
     Parameters
@@ -263,71 +346,36 @@ def run_triple_threat(
     response:
         A Scrapling ``Response`` with ``.url``, ``.body``, and ``.captured_xhr``.
     logger:
-        Optional logger, typically ``self.logger`` from the Spider.
-
-    Returns
-    -------
-    dict
-        Canonical extraction payload.
+        Optional logger.
     """
     url: str = getattr(response, "url", "")
 
+    # --- Strategy 1: XHR (fast — pure Python dict iteration) ----------------
     captured_xhr = getattr(response, "captured_xhr", []) or []
-    json_state: Optional[Dict[str, Any]] = extract_from_xhr(captured_xhr, logger)
+    xhr_payloads: List[Dict[str, Any]] = extract_from_xhr(captured_xhr, logger)
 
-    if json_state is None:
-        raw_bytes: bytes = getattr(response, "body", b"") or b""
-        encoding: str = getattr(response, "encoding", "utf-8") or "utf-8"
-        try:
-            html_str = raw_bytes.decode(encoding, errors="replace")
-        except (LookupError, UnicodeDecodeError):
-            html_str = raw_bytes.decode("utf-8", errors="replace")
+    # --- Strategy 2: Hydration (fast — regex on HTML string) ----------------
+    raw_bytes: bytes = getattr(response, "body", b"") or b""
+    encoding: str = getattr(response, "encoding", "utf-8") or "utf-8"
+    try:
+        html_str = raw_bytes.decode(encoding, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        html_str = raw_bytes.decode("utf-8", errors="replace")
 
-        json_state = extract_from_hydration(html_str, logger)
+    hydration_state: Optional[Dict[str, Any]] = extract_from_hydration(html_str, logger)
 
-    markdown_content: str = ""
-    if json_state is None:
-        raw_bytes = getattr(response, "body", b"") or b""
-        markdown_content = extract_via_markitdown(raw_bytes, logger) or ""
-        if not markdown_content and logger:
-            logger.warning(
-                "[PIPELINE] All three extraction strategies failed for: %s", url
-            )
+    # --- Strategy 3: MarkItDown (CPU-bound — runs in executor) --------------
+    raw_markdown: str = extract_via_markitdown(raw_bytes, logger) or ""
+
+    if not raw_markdown.strip() and logger:
+        logger.warning("[PIPELINE] MarkItDown produced no output for: %s", url)
+
+    extraction_methods = _determine_methods(xhr_payloads, hydration_state, raw_markdown)
 
     return {
         "url": url,
-        "extracted_json_state": json_state if json_state is not None else {},
-        "extracted_markdown": markdown_content,
+        "xhr_payloads": xhr_payloads,
+        "hydration_state": hydration_state,
+        "raw_markdown": raw_markdown,
+        "extraction_methods": extraction_methods,
     }
-
-
-def _collect_keys_recursive(obj: Any, depth: int = 0, max_depth: int = 5) -> set[str]:
-    """
-    Recursively collect all dictionary keys from a nested structure.
-
-    Parameters
-    ----------
-    obj:
-        Value to traverse.
-    depth:
-        Current recursion depth (internal use).
-    max_depth:
-        Maximum depth before short-circuiting (guards against stack overflow).
-
-    Returns
-    -------
-    set[str]
-        All string keys found anywhere in the structure, lowercased.
-    """
-    keys: set[str] = set()
-    if depth > max_depth:
-        return keys
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(k, str):
-                keys.add(k.lower())
-            keys |= _collect_keys_recursive(v, depth + 1, max_depth)
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            keys |= _collect_keys_recursive(item, depth + 1, max_depth)
-    return keys

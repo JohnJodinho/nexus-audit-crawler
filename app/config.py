@@ -21,12 +21,18 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
-from pydantic import field_validator, Field
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
+
+    #: Identifies this crawl run's Redis key namespace.
+    #: Every stream, set, lock, and counter key is prefixed with
+    #: ``crawl:{CRAWL_ID}:``.  Workers and the orchestrator must share
+    #: the same value to operate on the same crawl.
+    CRAWL_ID: str = "default"
 
     WORKER_COUNT: int = 2
     GLOBAL_MAX_PAGES: int = 50
@@ -41,6 +47,24 @@ class Settings(BaseSettings):
 
     HOSTNAME: str = ""
 
+    # -----------------------------------------------------------------------
+    # Database & Blob Storage (Phase 2)
+    # -----------------------------------------------------------------------
+    DATABASE_URL: str = ""
+
+    APP_WRITE_PROJECT_ID: str = ""
+    APP_WRITE_API_ENDPOINT: str = "https://cloud.appwrite.io/v1"
+    APP_WRITE_API_KEY: str = ""
+    APP_WRITE_BUCKET_ID: str = ""
+
+    # -----------------------------------------------------------------------
+    # Audit & Screenshot Settings (Phase 3 & 4)
+    # -----------------------------------------------------------------------
+    SCREENSHOT_ENABLED: bool = False
+    SCREENSHOT_FULL_PAGE: bool = True
+    NETWORK_IDLE_TIMEOUT_MS: int = 3000
+    PAGE_SETTLE_DELAY_MS: int = 0
+
     DATACENTER_PROXIES: Any = ""
     RESIDENTIAL_PROXIES: Any = ""
 
@@ -48,16 +72,13 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
+        extra="ignore",
     )
 
     @field_validator("DATACENTER_PROXIES", mode="before")
     @classmethod
     def parse_datacenter_proxies(cls, v: Any) -> List[str]:
-        """
-        Parse a comma-separated proxy string into ``List[str]``.
-
-        Returns an empty list when the variable is absent or blank.
-        """
+        """Parse a comma-separated proxy string into ``List[str]``."""
         if not v:
             return []
         return [p.strip() for p in str(v).split(",") if p.strip()]
@@ -65,12 +86,7 @@ class Settings(BaseSettings):
     @field_validator("RESIDENTIAL_PROXIES", mode="before")
     @classmethod
     def parse_residential_proxies(cls, v: Any) -> List[Dict[str, str]]:
-        """
-        Parse a comma-separated proxy string into Playwright proxy dicts.
-
-        Each entry is parsed into ``{"server": ..., "username": ..., "password": ...}``.
-        Returns an empty list when the variable is absent or blank.
-        """
+        """Parse a comma-separated proxy string into Playwright proxy dicts."""
         if not v:
             return []
 

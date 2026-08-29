@@ -4,3 +4,15 @@ pydantic
 pydantic-settings
 markitdown
 anyio
+pillow
+
+# Database & Storage (Phase 2)
+asyncpg
+sqlalchemy[asyncio]
+appwrite
+
+# Testing
+pytest
+pytest-asyncio
+fakeredis[lua]
+lupa

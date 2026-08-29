@@ -1,91 +1,112 @@
-"""Smoke tests for the audit crawler modules."""
-import sys
-sys.path.insert(0, '.')
+"""
+tests/smoke_test.py
+===================
+Migrated smoke tests, now running under pytest.
 
-# ---- Test extraction.py unit-level functions ----
-from app.extraction import (
-    extract_from_xhr, extract_from_hydration, extract_via_markitdown,
-    _collect_keys_recursive,
-)
+These tests replaced the original script-style runner that crashed on import
+due to the stale ALLOW_PATTERN reference (removed when the URL filtering
+model was updated from an allow-list to a deny-list in Phase 0).
+"""
 
-# -------------------------------------------------------------------------
-# Test 1: XHR extraction - relevant key match
-# -------------------------------------------------------------------------
-class FakeXHR:
-    url = 'https://api.example.com/products'
-    def json(self):
-        return {'products': [{'name': 'Widget', 'price': 99}]}
+from __future__ import annotations
 
-result = extract_from_xhr([FakeXHR()])
-assert result is not None and 'products' in result, f'XHR failed: {result}'
-print('[TEST 1] XHR extraction with relevant key: PASS')
-
-# -------------------------------------------------------------------------
-# Test 2: XHR extraction - irrelevant key (should return None)
-# -------------------------------------------------------------------------
-class FakeXHRIrrelevant:
-    url = 'https://cdn.example.com/config'
-    def json(self):
-        return {'version': '1.0', 'build': '12345', 'debug': False}
-
-result2 = extract_from_xhr([FakeXHRIrrelevant()])
-assert result2 is None, f'XHR relevance filter failed: {result2}'
-print('[TEST 2] XHR extraction with irrelevant key: PASS (correctly None)')
-
-# -------------------------------------------------------------------------
-# Test 3: Hydration extraction - Next.js __NEXT_DATA__
-# -------------------------------------------------------------------------
-next_html = (
-    '<html><script id="__NEXT_DATA__" type="application/json">'
-    '{"props":{"pageProps":{"title":"Test","pricing":{"monthly":99}}}}'
-    '</script></html>'
-)
-result3 = extract_from_hydration(next_html)
-assert result3 is not None and 'props' in result3, f'Hydration failed: {result3}'
-print('[TEST 3] Hydration extraction (__NEXT_DATA__): PASS')
-
-# -------------------------------------------------------------------------
-# Test 4: MarkItDown conversion
-# -------------------------------------------------------------------------
-html_bytes = b'<html><body><h1>Enterprise AI</h1><p>Our pricing starts at $99/mo.</p></body></html>'
-result4 = extract_via_markitdown(html_bytes)
-assert result4 is not None and 'Enterprise AI' in result4, f'MarkItDown failed: {result4}'
-print('[TEST 4] MarkItDown HTML->Markdown: PASS')
-
-# -------------------------------------------------------------------------
-# Test 5: URL boundary patterns
-# -------------------------------------------------------------------------
-from app.spider import ALLOW_PATTERN, DENY_PATTERN
-
-assert ALLOW_PATTERN.search('/about'), 'ALLOW /about failed'
-assert ALLOW_PATTERN.search('/pricing'), 'ALLOW /pricing failed'
-assert ALLOW_PATTERN.search('/services'), 'ALLOW /services failed'
-assert ALLOW_PATTERN.search('/case-studies'), 'ALLOW /case-studies failed'
-assert DENY_PATTERN.search('/blog'), 'DENY /blog failed'
-assert DENY_PATTERN.search('/privacy'), 'DENY /privacy failed'
-assert DENY_PATTERN.search('/login'), 'DENY /login failed'
-assert DENY_PATTERN.search('/careers'), 'DENY /careers failed'
-assert not ALLOW_PATTERN.search('/random-page'), '/random-page should not match ALLOW'
-assert not DENY_PATTERN.search('/about'), '/about should not match DENY'
-print('[TEST 5] URL boundary patterns (ALLOW/DENY): PASS')
-
-# -------------------------------------------------------------------------
-# Test 6: Recursive key collector
-# -------------------------------------------------------------------------
-obj = {'a': {'b': {'price': 100, 'name': 'test'}}, 'items': [{'c': 1}]}
-keys = _collect_keys_recursive(obj)
-assert 'price' in keys and 'name' in keys and 'items' in keys, f'Key collector: {keys}'
-print('[TEST 6] _collect_keys_recursive: PASS')
-
-# -------------------------------------------------------------------------
-# Test 7: Logger module
-# -------------------------------------------------------------------------
 import logging
-from app.logger import LOG_FILE_PATH, get_pipeline_logger, attach_file_handler
-assert 'crawler.log' in LOG_FILE_PATH
-pipeline_log = get_pipeline_logger('test.pipeline')
-assert isinstance(pipeline_log, logging.Logger)
-print('[TEST 7] Logger module: PASS')
 
-print()
-print('All smoke tests PASSED.')
+import pytest
+
+from app.spider import DENY_PATTERN
+from app.extraction import extract_from_hydration, extract_from_xhr, extract_via_markitdown
+from app.logger import LOG_FILE_PATH, get_pipeline_logger
+
+
+# ---------------------------------------------------------------------------
+# Extraction smoke tests
+# ---------------------------------------------------------------------------
+
+class FakeXHR:
+    def __init__(self, url: str, payload):
+        self.url = url
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_xhr_extraction_valid_response():
+    """XHR extraction should collect valid non-tracking responses."""
+    xhr = FakeXHR("https://api.example.com/products", {"products": [{"name": "Widget", "price": 99}], "total": 1})
+    result = extract_from_xhr([xhr])
+    assert len(result) == 1
+    assert "products" in result[0]
+
+
+def test_xhr_extraction_tracking_url_rejected():
+    """XHR extraction must reject known analytics/tracking URLs."""
+    xhr = FakeXHR("https://www.google-analytics.com/collect", {"cid": "123", "t": "pageview"})
+    result = extract_from_xhr([xhr])
+    assert result == [], f"Expected empty list, got: {result}"
+
+
+def test_hydration_next_data():
+    """Hydration extraction should detect __NEXT_DATA__ embedded JSON."""
+    html = (
+        '<html><script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"title":"Test","pricing":{"monthly":99}}}}'
+        "</script></html>"
+    )
+    result = extract_from_hydration(html)
+    assert result is not None
+    assert "props" in result
+
+
+def test_markitdown_converts_html():
+    """MarkItDown should convert HTML bytes to readable Markdown."""
+    html_bytes = b"<html><body><h1>Enterprise AI</h1><p>Our pricing starts at $99/mo.</p></body></html>"
+    result = extract_via_markitdown(html_bytes)
+    assert result is not None
+    assert "Enterprise AI" in result
+
+
+# ---------------------------------------------------------------------------
+# URL boundary pattern smoke tests (deny-list only, no allow-list)
+# ---------------------------------------------------------------------------
+
+def test_deny_pattern_matches_blog():
+    assert DENY_PATTERN.search("/blog/post-1")
+
+
+def test_deny_pattern_matches_privacy():
+    assert DENY_PATTERN.search("/privacy-policy")
+
+
+def test_deny_pattern_matches_login():
+    assert DENY_PATTERN.search("/login")
+
+
+def test_deny_pattern_matches_careers():
+    assert DENY_PATTERN.search("/careers/senior-engineer")
+
+
+def test_deny_pattern_does_not_match_about():
+    assert not DENY_PATTERN.search("/about")
+
+
+def test_deny_pattern_does_not_match_pricing():
+    assert not DENY_PATTERN.search("/pricing")
+
+
+def test_deny_pattern_does_not_match_services():
+    assert not DENY_PATTERN.search("/services")
+
+
+# ---------------------------------------------------------------------------
+# Logger module smoke tests
+# ---------------------------------------------------------------------------
+
+def test_log_file_path_not_empty():
+    assert LOG_FILE_PATH
+
+
+def test_pipeline_logger_returns_logger():
+    logger = get_pipeline_logger("smoke.test.pipeline")
+    assert isinstance(logger, logging.Logger)

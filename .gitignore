@@ -1,36 +1,82 @@
-# Virtual Environment
-venv/
+# ===========================================================================
+# Nexus Audit Crawler - Git Ignore Configuration
+# ===========================================================================
 
-# Environment Secrets
+# Environments & Secrets
 .env
 .env.*
 !.env.example
 
-# Python Cache
+# Python Bytecode & Cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Framework Caches
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
 .pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+htmlcov/
+
+# Crawler, Headless Browser & Engine Cache
 .scrapling_cache/
+.playwright/
+downloads/
+screenshots/
+blob_storage/
 
-# Application Logs & Outputs
-app/logs/*.log
-app/logs/*.txt
-app/logs/*.jsonl
-app/output.jsonl
-misc/
-*.json
+# Runtime Logs, JSON Dumps & Telemetry
+*.log
+app/logs/
 *.jsonl
-
-# Specific outputs
+setia_results.json
+setia_telemetry.json
 audit_results.json
 audit_results_dups.json
 audit_tasks.json
 audit_tasks_dups.json
 final_data.json
+output.jsonl
+misc/
 
-# Documentation
-MarkItDown_README.md
-redis_implementation_guide.md
-spiders_*.md
+# IDE & Operating System
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+.agents/
