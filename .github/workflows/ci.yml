@@ -28,9 +28,10 @@ jobs:
 
       - name: Run Pytest Test Suite
         env:
+          PYTHONPATH: "."
           REDIS_URL: "redis://localhost:6379/0"
         run: |
-          pytest tests/ -v --durations=10
+          python -m pytest tests/ -v --durations=10
 
   docker-build:
     name: Validate Docker Build
@@ -40,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: actions/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Container Image
         uses: docker/build-push-action@v5
