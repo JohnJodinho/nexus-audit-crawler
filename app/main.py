@@ -72,18 +72,10 @@ async def worker_loop(
     worker_id: str,
     redis: aioredis.Redis,
     crawl_id: str,
+    auto_exit_on_drain: bool = False,
 ) -> None:
     """
-    Single stateless worker coroutine.  Runs until cancelled.
-
-    Parameters
-    ----------
-    worker_id:
-        Unique consumer identifier within the Redis consumer group.
-    redis:
-        Shared async Redis connection pool.
-    crawl_id:
-        The crawl namespace identifier for all Redis key lookups.
+    Single stateless worker coroutine. Runs until cancelled or queue is drained.
     """
     _tasks_stream: str = tasks_key(crawl_id)
     _consumer_group: str = consumer_group_name(crawl_id)
@@ -93,6 +85,7 @@ async def worker_loop(
 
     log.info("[WORKER:%s] Started. Listening on %s", worker_id, _tasks_stream)
     pages_processed: int = 0
+    consecutive_idle: int = 0
 
     while True:
         # --- Lifecycle Control Checks -----------------------------------------
@@ -121,15 +114,21 @@ async def worker_loop(
             )
 
         except redis_exceptions.TimeoutError:
-            log.debug(
-                "[WORKER:%s] Idle timeout reading from %s (queue currently empty).",
-                worker_id,
-                _tasks_stream,
-            )
+            consecutive_idle += 1
+            if auto_exit_on_drain and consecutive_idle >= 2:
+                log.info("[WORKER:%s] Queue drained (idle timeout reached). Exiting.", worker_id)
+                break
             continue
 
         if not raw_messages:
+            consecutive_idle += 1
+            if auto_exit_on_drain and consecutive_idle >= 2:
+                log.info("[WORKER:%s] Queue drained (no messages). Exiting.", worker_id)
+                break
             continue
+
+        consecutive_idle = 0
+
 
         _stream_name, entries = raw_messages[0]
         if not entries:
@@ -531,5 +530,34 @@ async def main() -> None:
         log.info("[SHUTDOWN] Redis connection pool closed.")
 
 
+async def run_workers_for_crawl(crawl_id: str, worker_count: int = 2) -> None:
+    """
+    In-process background worker launcher for a specific crawl_id.
+    Runs until the task queue is drained, then cleans up gracefully.
+    """
+    log.info("[WORKER_SPAWNER] Starting %d in-process worker(s) for crawl %s...", worker_count, crawl_id)
+    redis: aioredis.Redis = create_redis_pool(max_connections=worker_count * 3)
+    try:
+        await ensure_consumer_group(redis, crawl_id)
+        worker_coroutines = [
+            worker_loop(
+                worker_id=f"inproc-{i}",
+                redis=redis,
+                crawl_id=crawl_id,
+                auto_exit_on_drain=True,
+            )
+            for i in range(min(worker_count, 4))
+        ]
+        await asyncio.gather(*worker_coroutines)
+        log.info("[WORKER_SPAWNER] In-process workers finished for crawl %s.", crawl_id)
+    except asyncio.CancelledError:
+        log.info("[WORKER_SPAWNER] In-process workers cancelled for crawl %s.", crawl_id)
+    except Exception as exc:
+        log.error("[WORKER_SPAWNER] In-process worker error for %s: %s", crawl_id, exc, exc_info=True)
+    finally:
+        await redis.aclose()
+
+
 if __name__ == "__main__":
     anyio.run(main)
+

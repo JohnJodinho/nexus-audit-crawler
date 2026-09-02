@@ -219,10 +219,18 @@ async def create_crawl(
         worker_count=worker_count,
     )
 
+    # 7. Fallback / Immediate Processing: If GitHub Actions was not dispatched (e.g. no GITHUB_TOKEN configured),
+    # launch the background worker coroutine directly inside this container so it starts crawling immediately!
+    if not dispatched:
+        import asyncio
+        from app.main import run_workers_for_crawl
+        log.info("[CRAWL_API] Spawning in-process background workers for %s...", crawl_id_str)
+        asyncio.create_task(run_workers_for_crawl(crawl_id=crawl_id_str, worker_count=worker_count))
+
     msg = (
         f"Crawl {crawl_id_str} enqueued and auto-dispatched to GitHub Actions for {canonical}"
         if dispatched
-        else f"Crawl {crawl_id_str} enqueued successfully for {canonical}"
+        else f"Crawl {crawl_id_str} enqueued and active background workers spawned for {canonical}"
     )
 
     return CrawlCreateResponse(
@@ -231,6 +239,7 @@ async def create_crawl(
         message=msg,
         is_duplicate=False,
     )
+
 
 
 @router.get("/{crawl_id}", response_model=CrawlResponse)
