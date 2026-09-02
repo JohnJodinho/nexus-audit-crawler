@@ -1,7 +1,11 @@
-scrapling
+scrapling[all]
 curl_cffi
 patchright
 playwright
+msgspec
+browserforge
+tld
+trafilatura
 redis
 pydantic
 pydantic-settings
