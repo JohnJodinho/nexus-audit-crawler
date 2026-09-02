@@ -549,14 +549,18 @@ class AuditSpider(Spider):
         has_xhr: bool = bool(item.get("xhr_payloads"))
         has_hydration: bool = bool(item.get("hydration_state"))
         has_markdown: bool = bool(item.get("raw_markdown", "").strip())
+        has_metadata: bool = bool(item.get("metadata"))
 
-        if not has_xhr and not has_hydration and not has_markdown:
+        if not has_xhr and not has_hydration and not has_markdown and not has_metadata:
             self.logger.warning(
-                "[PIPELINE] DROP -- no data extracted for %s. "
-                "All three strategies returned empty results.",
+                "[PIPELINE] DROP -- no data extracted for %s.",
                 url,
             )
             return None
+
+        # If raw_markdown is empty on JavaScript/SPA shells, supply fallback text for Appwrite/storage
+        if not has_markdown:
+            item["raw_markdown"] = f"# {url}\n\n*Client-rendered page or empty DOM body.*"
 
         extraction_methods = item.get("extraction_methods", ["none"])
         self.logger.info(
@@ -564,6 +568,7 @@ class AuditSpider(Spider):
             url,
             ", ".join(extraction_methods),
         )
+
 
         redis_payload: Dict[str, str] = {
             "schema_version": "1",
