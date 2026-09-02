@@ -95,6 +95,21 @@ async def worker_loop(
     pages_processed: int = 0
 
     while True:
+        # --- Lifecycle Control Checks -----------------------------------------
+        try:
+            cancelled = await redis.get(f"crawl:{crawl_id}:control:cancelled")
+            if cancelled:
+                log.info("[WORKER:%s] Crawl %s marked CANCELLED. Exiting worker.", worker_id, crawl_id)
+                break
+
+            paused = await redis.get(f"crawl:{crawl_id}:control:paused")
+            if paused:
+                log.debug("[WORKER:%s] Crawl %s is PAUSED. Holding state...", worker_id, crawl_id)
+                await asyncio.sleep(2.0)
+                continue
+        except Exception as ctrl_err:
+            log.debug("[WORKER:%s] Control check error: %s", worker_id, ctrl_err)
+
         # --- Consume one task -------------------------------------------------
         try:
             raw_messages: Optional[list] = await redis.xreadgroup(
@@ -104,6 +119,7 @@ async def worker_loop(
                 count=1,
                 block=_XREAD_BLOCK_MS,
             )
+
         except redis_exceptions.TimeoutError:
             log.debug(
                 "[WORKER:%s] Idle timeout reading from %s (queue currently empty).",

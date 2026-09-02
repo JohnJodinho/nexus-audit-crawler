@@ -73,7 +73,12 @@ async def test_health_check(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_create_crawl_success(client: AsyncClient, mock_db_session: AsyncMock):
+async def test_create_crawl_success(client: AsyncClient, mock_db_session: AsyncMock, test_redis):
+    # Mock no active in-flight crawl
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = None
+    mock_db_session.execute.return_value = mock_res
+
     payload = {
         "url": "https://audit-target.com/",
         "crawl_id": "test-new-crawl",
@@ -84,14 +89,42 @@ async def test_create_crawl_success(client: AsyncClient, mock_db_session: AsyncM
     data = resp.json()
     assert data["crawl_id"] == "test-new-crawl"
     assert data["status"] == "queued"
+    assert data["is_duplicate"] is False
     mock_db_session.add.assert_called_once()
     mock_db_session.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_crawl_duplicate_deduplication(client: AsyncClient, mock_db_session: AsyncMock, test_redis):
+    """Verify that duplicate in-flight requests return the existing crawl idempotently."""
+    existing_crawl = Crawl(
+        id=uuid.uuid4(),
+        target_url="https://audit-target.com/",
+        target_domain="audit-target.com",
+        status="running",
+        config={"crawl_id": "existing-crawl-123"},
+    )
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = existing_crawl
+    mock_db_session.execute.return_value = mock_res
+
+    payload = {
+        "url": "https://audit-target.com/",
+        "config": {"max_pages": 10, "max_depth": 1, "worker_count": 2},
+    }
+    resp = await client.post("/api/crawls", json=payload)
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["is_duplicate"] is True
+    assert data["crawl_id"] == "existing-crawl-123"
+    assert data["status"] == "running"
 
 
 @pytest.mark.asyncio
 async def test_create_crawl_invalid_url(client: AsyncClient):
     resp = await client.post("/api/crawls", json={"url": "not-a-valid-url"})
     assert resp.status_code in (422, 400)
+
 
 
 @pytest.mark.asyncio
@@ -452,3 +485,216 @@ async def test_get_summary(client: AsyncClient, mock_db_session: AsyncMock):
     assert data["finding_counts_by_category"]["security"] == 2
     assert data["finding_counts_by_severity"]["critical"] == 3
     assert len(data["top_findings"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle Control & Observability Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_crawls(client: AsyncClient, mock_db_session: AsyncMock):
+    mock_crawl = Crawl(
+        id=uuid.uuid4(),
+        target_url="https://example.com/",
+        target_domain="example.com",
+        status="running",
+        pages_processed=0,
+        pages_failed=0,
+        started_at=datetime.datetime.now(datetime.UTC),
+    )
+    res_count = MagicMock()
+    res_count.scalar_one.return_value = 1
+    res_crawls = MagicMock()
+    res_crawls.scalars.return_value.all.return_value = [mock_crawl]
+    res_fcount = MagicMock()
+    res_fcount.scalar_one.return_value = 5
+
+    mock_db_session.execute.side_effect = [res_count, res_crawls, res_fcount]
+
+    resp = await client.get("/api/crawls?limit=10&offset=0")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert len(data["crawls"]) == 1
+    assert data["crawls"][0]["target_domain"] == "example.com"
+
+
+
+@pytest.mark.asyncio
+async def test_cancel_crawl(client: AsyncClient, mock_db_session: AsyncMock, test_redis):
+    crawl_id = "test-cancel-01"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com",
+        target_domain="example.com",
+        status="running",
+    )
+    mock_res = MagicMock()
+    mock_res.scalar_one_or_none.return_value = mock_crawl
+    mock_db_session.execute.return_value = mock_res
+
+    resp = await client.post(f"/api/crawls/{crawl_id}/cancel")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["action"] == "cancelled"
+    assert data["current_status"] == "cancelled"
+    assert mock_crawl.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_crawl(client: AsyncClient, mock_db_session: AsyncMock, test_redis):
+    crawl_id = "test-pause-resume"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com",
+        target_domain="example.com",
+        status="running",
+    )
+    mock_res = MagicMock()
+    mock_res.scalar_one_or_none.return_value = mock_crawl
+    mock_db_session.execute.return_value = mock_res
+
+    # 1. Pause
+    resp = await client.post(f"/api/crawls/{crawl_id}/pause")
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "paused"
+    assert mock_crawl.status == "paused"
+
+    # 2. Resume
+    resp = await client.post(f"/api/crawls/{crawl_id}/resume")
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "resumed"
+    assert mock_crawl.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_get_telemetry(client: AsyncClient, mock_db_session: AsyncMock):
+    crawl_id = "test-telemetry-01"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(id=crawl_uuid, target_url="https://example.com", status="running")
+
+    res_crawl = MagicMock()
+    res_crawl.scalar_one_or_none.return_value = mock_crawl
+    res_total = MagicMock()
+    res_total.scalar_one.return_value = 10
+    res_reasons = MagicMock()
+    res_reasons.all.return_value = [("OFF_DOMAIN", 7), ("ALREADY_VISITED", 3)]
+    res_events = MagicMock()
+    res_events.scalars.return_value.all.return_value = []
+
+    mock_db_session.execute.side_effect = [res_crawl, res_total, res_reasons, res_events]
+
+    resp = await client.get(f"/api/crawls/{crawl_id}/telemetry")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_dropped"] == 10
+    assert len(data["dropped_reasons"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_graph(client: AsyncClient, mock_db_session: AsyncMock):
+    crawl_id = "test-graph-01"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(id=crawl_uuid, target_url="https://example.com", status="completed")
+
+    p1 = Page(
+        id=1,
+        crawl_id=crawl_uuid,
+        url="https://example.com",
+        canonical_url="https://example.com",
+        status_code=200,
+        metadata_={"seo": {"title": "Home"}, "links": [{"url": "https://example.com/about", "text": "About"}]},
+    )
+    p2 = Page(
+        id=2,
+        crawl_id=crawl_uuid,
+        url="https://example.com/about",
+        canonical_url="https://example.com/about",
+        status_code=200,
+        metadata_={"seo": {"title": "About"}, "links": []},
+    )
+
+    res_crawl = MagicMock()
+    res_crawl.scalar_one_or_none.return_value = mock_crawl
+    res_pages = MagicMock()
+    res_pages.scalars.return_value.all.return_value = [p1, p2]
+    res_f1 = MagicMock()
+    res_f1.scalars.return_value.all.return_value = []
+    res_f2 = MagicMock()
+    res_f2.scalars.return_value.all.return_value = []
+
+    mock_db_session.execute.side_effect = [res_crawl, res_pages, res_f1, res_f2]
+
+    resp = await client.get(f"/api/crawls/{crawl_id}/graph")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_nodes"] == 2
+    assert data["total_edges"] == 1
+    assert data["edges"][0]["source"] == "https://example.com"
+    assert data["edges"][0]["target"] == "https://example.com/about"
+
+
+@pytest.mark.asyncio
+async def test_export_report_json_and_markdown(client: AsyncClient, mock_db_session: AsyncMock):
+    crawl_id = "test-export-01"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com",
+        target_domain="example.com",
+        status="completed",
+        pages_processed=2,
+        pages_failed=0,
+        config={"consolidation": {"health_scorecard": {"h1_coverage_pct": 100, "average_security_score": 95}}},
+    )
+
+
+    res_crawl = MagicMock()
+    res_crawl.scalar_one_or_none.return_value = mock_crawl
+    res_pages = MagicMock()
+    res_pages.scalars.return_value.all.return_value = []
+    res_findings = MagicMock()
+    res_findings.scalars.return_value.all.return_value = []
+
+    mock_db_session.execute.side_effect = [
+        res_crawl, res_pages, res_findings,  # for json
+        res_crawl, res_pages, res_findings,  # for markdown
+    ]
+
+    # 1. JSON Export
+    resp = await client.get(f"/api/crawls/{crawl_id}/export?format=json")
+    assert resp.status_code == 200
+    assert resp.json()["format"] == "json"
+
+    # 2. Markdown Export
+    resp_md = await client.get(f"/api/crawls/{crawl_id}/export?format=markdown")
+    assert resp_md.status_code == 200
+    assert resp_md.json()["format"] == "markdown"
+    assert "# Nexus Audit Report" in resp_md.json()["content"]
+
+
+@pytest.mark.asyncio
+async def test_delete_crawl(client: AsyncClient, mock_db_session: AsyncMock, test_redis):
+    crawl_id = "test-delete-01"
+    crawl_uuid = resolve_crawl_uuid(crawl_id)
+    mock_crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com",
+        target_domain="example.com",
+        status="finished",
+    )
+    res_crawl = MagicMock()
+    res_crawl.scalar_one_or_none.return_value = mock_crawl
+    res_pages = MagicMock()
+    res_pages.scalars.return_value.all.return_value = []
+
+    mock_db_session.execute.side_effect = [res_crawl, res_pages]
+
+    resp = await client.delete(f"/api/crawls/{crawl_id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["action"] == "deleted"
+    mock_db_session.delete.assert_called_once_with(mock_crawl)
+

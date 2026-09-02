@@ -1,7 +1,7 @@
 """
 app/api/schemas.py
 ==================
-Pydantic schemas for request validation and structured API responses.
+Pydantic schemas for request validation, structured API responses, and lifecycle operations.
 """
 
 from __future__ import annotations
@@ -10,6 +10,10 @@ import datetime
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
+
+# ---------------------------------------------------------------------------
+# Crawl Configuration & Creation Schemas
+# ---------------------------------------------------------------------------
 
 class CrawlConfig(BaseModel):
     max_pages: int = Field(default=15, ge=1, le=1000)
@@ -23,7 +27,6 @@ class CrawlConfig(BaseModel):
     categories: Optional[List[str]] = None
 
 
-
 class CrawlCreateRequest(BaseModel):
     url: str = Field(..., description="Target seed URL to crawl and audit.")
     crawl_id: Optional[str] = Field(default=None, description="Optional custom crawl ID.")
@@ -34,7 +37,13 @@ class CrawlCreateResponse(BaseModel):
     crawl_id: str
     status: str
     message: str
+    is_duplicate: bool = False
+    existing_crawl_id: Optional[str] = None
 
+
+# ---------------------------------------------------------------------------
+# Crawl Inspection & History Schemas
+# ---------------------------------------------------------------------------
 
 class CrawlResponse(BaseModel):
     id: str
@@ -48,7 +57,27 @@ class CrawlResponse(BaseModel):
     pages_processed: int = 0
     pages_failed: int = 0
     config: Dict[str, Any] = Field(default_factory=dict)
+    consolidated_report: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+
+class CrawlListItem(BaseModel):
+    id: str
+    target_url: str
+    target_domain: str
+    status: str
+    started_at: Optional[datetime.datetime] = None
+    finished_at: Optional[datetime.datetime] = None
+    pages_processed: int = 0
+    pages_failed: int = 0
+    findings_count: int = 0
+
+
+class CrawlListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    crawls: List[CrawlListItem]
 
 
 class CrawlStatusResponse(BaseModel):
@@ -61,6 +90,23 @@ class CrawlStatusResponse(BaseModel):
     progress: float = Field(..., ge=0.0, le=1.0, description="Estimated completion progress (0.0 to 1.0).")
     next_recommended_action: Literal["wait", "retrieve", "none"]
 
+
+# ---------------------------------------------------------------------------
+# Lifecycle Control Schemas
+# ---------------------------------------------------------------------------
+
+class CrawlControlResponse(BaseModel):
+    crawl_id: str
+    action: Literal["cancelled", "paused", "resumed", "consolidated", "retried_failed", "deleted"]
+    previous_status: str
+    current_status: str
+    message: str
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Audit Findings Schemas
+# ---------------------------------------------------------------------------
 
 class AuditFindingResponse(BaseModel):
     id: str
@@ -89,6 +135,10 @@ class PaginatedFindingsResponse(BaseModel):
     total_pages: int
     findings: List[AuditFindingResponse]
 
+
+# ---------------------------------------------------------------------------
+# Page Detail & Summary Schemas
+# ---------------------------------------------------------------------------
 
 class PageSummaryItem(BaseModel):
     id: int
@@ -124,3 +174,82 @@ class CrawlSummaryResponse(BaseModel):
     finding_counts_by_category: Dict[str, int]
     finding_counts_by_severity: Dict[str, int]
     top_findings: List[AuditFindingResponse]
+
+
+# ---------------------------------------------------------------------------
+# Observability: Telemetry, DLQ, Graph & Export Schemas
+# ---------------------------------------------------------------------------
+
+class TelemetryReasonCount(BaseModel):
+    reason: str
+    count: int
+
+
+class CrawlTelemetryResponse(BaseModel):
+    crawl_id: str
+    total_dropped: int
+    dropped_reasons: List[TelemetryReasonCount]
+    recent_events: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class DLQItem(BaseModel):
+    id: int
+    url: str
+    dlq_reason: str
+    failed_at_utc: Optional[datetime.datetime] = None
+    task_fields: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CrawlDLQResponse(BaseModel):
+    crawl_id: str
+    total_failed_tasks: int
+    items: List[DLQItem]
+
+
+class GraphNode(BaseModel):
+    id: str
+    url: str
+    title: Optional[str] = None
+    status_code: int = 200
+    findings_count: int = 0
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    anchor_text: Optional[str] = None
+
+
+class CrawlGraphResponse(BaseModel):
+    crawl_id: str
+    total_nodes: int
+    total_edges: int
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
+
+
+class CrawlExportResponse(BaseModel):
+    crawl_id: str
+    format: Literal["json", "markdown"]
+    generated_at: datetime.datetime
+    content: str
+
+
+# ---------------------------------------------------------------------------
+# Standardized Error Schema (RFC 7807)
+# ---------------------------------------------------------------------------
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    field: Optional[str] = None
+
+
+class ErrorResponse(BaseModel):
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str
+    instance: Optional[str] = None
+    errors: Optional[List[ErrorDetail]] = None
+    timestamp: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.UTC))

@@ -49,7 +49,15 @@ class Crawl(Base):
     config: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+
     pages: Mapped[List[Page]] = relationship("Page", back_populates="crawl", cascade="all, delete-orphan")
+
+    @property
+    def consolidated_report(self) -> Optional[Dict[str, Any]]:
+        """Return the compiled consolidation report if present in config."""
+        return (self.config or {}).get("consolidation")
+
+
 
 
 class Page(Base):

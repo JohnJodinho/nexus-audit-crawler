@@ -2,7 +2,7 @@
 app/api/app.py
 ==============
 FastAPI application factory for the Nexus Audit Query API (Phase 3).
-Includes optional embedded persistence worker for single-container free-tier deployment.
+Includes full lifecycle state machine routes, graph visualizer, and RFC 7807 error formatting.
 """
 
 from __future__ import annotations
@@ -11,10 +11,20 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from app.api.routes import crawls, findings, pages, status, summary
+from app.api.routes import (
+    control,
+    crawls,
+    findings,
+    graph,
+    pages,
+    status as status_route,
+    summary,
+    telemetry,
+)
 from app.config import settings
 from app.db.engine import close_engine
 from app.models.schema import init_db
@@ -80,7 +90,7 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application instance."""
     app = FastAPI(
         title="Nexus Audit Query API",
-        description="Deterministic REST API powering AuditMorph Studio and MCP Adapters.",
+        description="Deterministic REST API powering AuditMorph Studio and MCP Adapters with complete lifecycle management.",
         version="1.0.0",
         lifespan=lifespan,
     )
@@ -96,7 +106,10 @@ def create_app() -> FastAPI:
 
     # Mount API routers
     app.include_router(crawls.router, prefix="/api/crawls", tags=["Crawls"])
-    app.include_router(status.router, prefix="/api/crawls", tags=["Status"])
+    app.include_router(status_route.router, prefix="/api/crawls", tags=["Status"])
+    app.include_router(control.router, prefix="/api/crawls", tags=["Lifecycle Control"])
+    app.include_router(telemetry.router, prefix="/api/crawls", tags=["Telemetry & DLQ"])
+    app.include_router(graph.router, prefix="/api/crawls", tags=["Graph & Export"])
     app.include_router(findings.router, prefix="/api/crawls", tags=["Findings"])
     app.include_router(pages.router, prefix="/api/crawls", tags=["Pages"])
     app.include_router(summary.router, prefix="/api/crawls", tags=["Summary"])
