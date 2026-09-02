@@ -83,6 +83,7 @@ class Page(Base):
 
     crawl: Mapped[Crawl] = relationship("Crawl", back_populates="pages")
     contacts: Mapped[List[PageContact]] = relationship("PageContact", back_populates="page", cascade="all, delete-orphan")
+    findings: Mapped[List["AuditFinding"]] = relationship("AuditFinding", back_populates="page", cascade="all, delete-orphan")
 
     __table_args__ = (
         UniqueConstraint("crawl_id", "canonical_url", name="uq_crawl_canonical_url"),
@@ -101,6 +102,66 @@ class PageContact(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False, index=True)
 
     page: Mapped[Page] = relationship("Page", back_populates="contacts")
+
+
+class AuditFinding(Base):
+    """
+    A single deterministic audit finding for a crawled page.
+
+    ``id`` is the globally-unique instance key composed as ``"{page_id}:{rule_id}"``
+    (e.g. ``"456:seo.missing_h1"``).  This is the key all WebMCP tools key off.
+
+    ``rule_id`` is the reusable taxonomy code (``"seo.missing_h1"``) that can
+    appear across many pages; ``id`` uniquely identifies this specific instance.
+
+    ``canvas_zone`` is a **closed enum**: ``"nav"`` | ``"head"`` | ``"content"``
+    | ``"footer"`` | ``"server"``.  ``"server"`` is used for response-level
+    findings (security headers) that have no DOM position.
+
+    ``status`` is seeded as ``"open"`` at write time.  Runtime state mutation
+    (``pending_review``, ``approved``, ``rejected``) lives in the AuditMorph
+    browser ``findingState`` dict and is **not** written back here until Phase 5.
+    """
+    __tablename__ = "audit_findings"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    # rule_id is the reusable taxonomy code; id is the unique per-page instance
+    rule_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    crawl_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("crawls.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    page_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("pages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Classification
+    category: Mapped[str] = mapped_column(String(32), nullable=False)   # seo|security|performance|accessibility
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)   # critical|warning|info
+    canvas_zone: Mapped[str] = mapped_column(String(16), nullable=False) # nav|head|content|footer|server
+
+    # Human-readable description
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Evidence: {selector, observed, expected}
+    evidence: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # Optional proposed fix: {proposed, confidence}
+    remediation: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    # Seed state — only "open" is written here; runtime transitions live in AuditMorph findingState
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+
+    detected_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now()
+    )
+    metadata_: Mapped[Dict[str, Any]] = mapped_column("finding_metadata", JSONB, default=dict)
+
+    page: Mapped["Page"] = relationship("Page", back_populates="findings")
+
+    __table_args__ = (
+        UniqueConstraint("page_id", "rule_id", name="uq_page_rule"),
+    )
 
 
 class PageLink(Base):

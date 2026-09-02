@@ -1,0 +1,62 @@
+name: Ephemeral Crawl Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed_url:
+        description: "Seed URL to crawl and audit"
+        required: true
+        default: "https://www.umgc.edu/current-students"
+      max_pages:
+        description: "Maximum pages to crawl"
+        required: false
+        default: "15"
+      max_depth:
+        description: "Maximum depth"
+        required: false
+        default: "2"
+      worker_count:
+        description: "Worker concurrency"
+        required: false
+        default: "3"
+
+jobs:
+  run-crawl:
+    name: Execute Crawl Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Enqueue Seed & Run Workers
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APP_WRITE_PROJECT_ID: ${{ secrets.APP_WRITE_PROJECT_ID }}
+          APP_WRITE_API_ENDPOINT: ${{ secrets.APP_WRITE_API_ENDPOINT }}
+          APP_WRITE_API_KEY: ${{ secrets.APP_WRITE_API_KEY }}
+          APP_WRITE_BUCKET_ID: ${{ secrets.APP_WRITE_BUCKET_ID }}
+          GLOBAL_MAX_PAGES: ${{ github.event.inputs.max_pages }}
+          MAX_DEPTH: ${{ github.event.inputs.max_depth }}
+          WORKER_COUNT: ${{ github.event.inputs.worker_count }}
+        run: |
+          CRAWL_ID="gh-$(date +%s)"
+          echo "Launching crawl $CRAWL_ID for ${{ github.event.inputs.seed_url }}..."
+          
+          # 1. Enqueue seed via orchestrator
+          python -m app.orchestrator --url "${{ github.event.inputs.seed_url }}" --crawl-id "$CRAWL_ID" --depth ${{ github.event.inputs.max_depth }}
+          
+          # 2. Run workers until budget reached or queue drained
+          export CRAWL_ID="$CRAWL_ID"
+          python -m app.main

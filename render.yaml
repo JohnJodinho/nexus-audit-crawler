@@ -1,0 +1,56 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Nexus Query API (FastAPI REST Service + Health Check)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: nexus-query-api
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_WRITE_PROJECT_ID
+        sync: false
+      - key: APP_WRITE_API_ENDPOINT
+        sync: false
+      - key: APP_WRITE_API_KEY
+        sync: false
+      - key: APP_WRITE_BUCKET_ID
+        sync: false
+      - key: WORKER_COUNT
+        value: "2"
+      - key: GLOBAL_MAX_PAGES
+        value: "50"
+      - key: MAX_DEPTH
+        value: "2"
+
+  # ---------------------------------------------------------------------------
+  # 2. Nexus Persistence Consumer (Durable Background Worker)
+  # ---------------------------------------------------------------------------
+  - type: worker
+    name: nexus-persistence-worker
+    runtime: docker
+    dockerfilePath: Dockerfile
+    dockerCommand: python -m app.persistence_worker --crawl-id global
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    envVars:
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_WRITE_PROJECT_ID
+        sync: false
+      - key: APP_WRITE_API_ENDPOINT
+        sync: false
+      - key: APP_WRITE_API_KEY
+        sync: false
+      - key: APP_WRITE_BUCKET_ID
+        sync: false

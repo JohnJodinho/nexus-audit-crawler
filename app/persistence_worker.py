@@ -35,6 +35,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.config import settings
 from app.db.engine import get_sessionmaker
 from app.models.schema import (
+    AuditFinding,
     Crawl,
     DeadLetterTask,
     DroppedTelemetry,
@@ -52,6 +53,7 @@ from app.redis_client import (
 )
 from app.storage.appwrite_client import storage_client
 from app.utils.utilities import canonicalize_url, get_fingerprint
+from app.audit.rules import evaluate_findings
 
 log = logging.getLogger("audit_crawler.persist")
 
@@ -265,6 +267,54 @@ async def process_result_message(
         .where(Crawl.id == crawl_uuid)
         .values(pages_processed=Crawl.pages_processed + 1)
     )
+
+    # 6. Run deterministic audit rules and bulk-upsert findings (Phase 2)
+    audit_metadata = metadata.get("audit") if isinstance(metadata, dict) else None
+    if not audit_metadata:
+        # Older payloads store audit keys at the top level of metadata
+        audit_metadata = metadata if isinstance(metadata, dict) else {}
+
+    findings_to_write = evaluate_findings(
+        page_id=page_id,
+        crawl_id=crawl_id,
+        url=canonical,
+        audit_metadata=audit_metadata,
+        status_code=int(payload.get("status_code", 200)),
+    )
+
+    if findings_to_write:
+        for finding in findings_to_write:
+            finding_stmt = insert(AuditFinding).values(
+                id=finding["id"],
+                rule_id=finding["rule_id"],
+                crawl_id=crawl_uuid,
+                page_id=page_id,
+                url=finding["url"],
+                category=finding["category"],
+                severity=finding["severity"],
+                canvas_zone=finding["canvas_zone"],
+                explanation=finding["explanation"],
+                evidence=finding["evidence"],
+                remediation=finding.get("remediation"),
+                status="open",
+                finding_metadata=finding.get("finding_metadata") or {},
+            ).on_conflict_do_update(
+                constraint="uq_page_rule",
+                set_={
+                    "explanation": finding["explanation"],
+                    "evidence": finding["evidence"],
+                    "remediation": finding.get("remediation"),
+                    "severity": finding["severity"],
+                },
+            )
+            await session.execute(finding_stmt)
+
+        log.info(
+            "[PERSIST] Wrote %d finding(s) for page %s (page_id=%s)",
+            len(findings_to_write),
+            canonical,
+            page_id,
+        )
 
     log.info(
         "[PERSIST] Saved page: id=%s url=%s md_file=%s contacts=(%d e, %d p)",

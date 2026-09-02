@@ -11,6 +11,12 @@ asyncpg
 sqlalchemy[asyncio]
 appwrite
 
+# API & Server (Phase 3 & 4)
+fastapi
+uvicorn
+httpx
+mcp
+
 # Testing
 pytest
 pytest-asyncio

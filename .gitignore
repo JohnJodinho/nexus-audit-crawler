@@ -1,5 +1,5 @@
 # ===========================================================================
-# Nexus Audit Crawler - Git Ignore Configuration
+# Nexus Audit Crawler & API Server - Git Ignore Configuration
 # ===========================================================================
 
 # Environments & Secrets
@@ -57,19 +57,21 @@ downloads/
 screenshots/
 blob_storage/
 
-# Runtime Logs, JSON Dumps & Telemetry
+# Runtime Logs, Dumps & Telemetry
 *.log
 app/logs/
 *.jsonl
-setia_results.json
-setia_telemetry.json
-audit_results.json
-audit_results_dups.json
-audit_tasks.json
-audit_tasks_dups.json
-final_data.json
-output.jsonl
+*.json
+!pyproject.toml
+
+# Research, Documentation & Untracked Local Files
 misc/
+docs/
+docs_research/
+scratch/
+brain/
+auditmorph/
+instructions.md
 
 # IDE & Operating System
 .vscode/
@@ -80,3 +82,4 @@ misc/
 Thumbs.db
 desktop.ini
 .agents/
+.gemini/
