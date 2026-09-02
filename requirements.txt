@@ -1,4 +1,5 @@
 scrapling
+curl_cffi
 redis
 pydantic
 pydantic-settings
@@ -15,10 +16,11 @@ appwrite
 fastapi
 uvicorn
 httpx
-mcp
+mcp<2
 
 # Testing
 pytest
 pytest-asyncio
 fakeredis[lua]
 lupa
+aiosqlite

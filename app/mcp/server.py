@@ -8,7 +8,16 @@ from __future__ import annotations
 
 import sys
 from typing import Any, Dict, Optional
-from mcp.server.fastmcp import FastMCP
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except (ImportError, ModuleNotFoundError):
+        FastMCP = None
+
+mcp = FastMCP("Nexus Audit Server") if FastMCP else None
 
 from app.mcp.client import (
     api_get_audit_findings,
@@ -19,9 +28,7 @@ from app.mcp.client import (
     api_start_audit,
 )
 
-mcp = FastMCP(
-    name="Nexus Audit Server",
-)
+
 
 
 @mcp.tool()
