@@ -1,5 +1,6 @@
 scrapling
 curl_cffi
+playwright
 redis
 pydantic
 pydantic-settings
