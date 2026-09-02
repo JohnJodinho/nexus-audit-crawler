@@ -95,6 +95,20 @@ async def test_create_crawl_invalid_url(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_create_crawl_worker_count_exceeds_limit(client: AsyncClient):
+    """Verify that specifying worker_count > 4 fails validation with HTTP 422."""
+    payload = {
+        "url": "https://example.com/",
+        "crawl_id": "test-limit-exceeded",
+        "config": {"max_pages": 10, "max_depth": 1, "worker_count": 8},
+    }
+    resp = await client.post("/api/crawls", json=payload)
+    assert resp.status_code == 422
+    assert "exceed" in resp.text.lower() or "less than or equal to 4" in resp.text.lower()
+
+
+
+@pytest.mark.asyncio
 async def test_get_crawl_found(client: AsyncClient, mock_db_session: AsyncMock):
     crawl_id = "test-crawl-01"
     crawl_uuid = resolve_crawl_uuid(crawl_id)

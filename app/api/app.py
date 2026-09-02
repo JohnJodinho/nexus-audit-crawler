@@ -24,6 +24,16 @@ from app.redis_client import create_redis_pool, ensure_persist_consumer_groups
 log = logging.getLogger("audit_crawler.api")
 
 
+class HealthCheckFilter(logging.Filter):
+    """Filter out noisy /health and root probe logs from Uvicorn access logger."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("/health" in msg or "GET / " in msg or "GET / HTTP" in msg)
+
+# Apply filter to uvicorn access logger
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
+
 async def run_embedded_persistence_worker():
     """Background task to run persistence consumer concurrently within the web server."""
     log.info("[EMBEDDED_WORKER] Starting embedded persistence consumer loop...")

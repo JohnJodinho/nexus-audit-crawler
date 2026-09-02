@@ -3,9 +3,13 @@ name: Ephemeral Crawl Dispatch
 on:
   workflow_dispatch:
     inputs:
+      crawl_id:
+        description: "Crawl identifier namespace"
+        required: false
+        default: ""
       seed_url:
-        description: "Seed URL to crawl and audit"
-        required: true
+        description: "Seed URL to crawl and audit (if triggering manually)"
+        required: false
         default: "https://www.umgc.edu/current-students"
       max_pages:
         description: "Maximum pages to crawl"
@@ -16,13 +20,13 @@ on:
         required: false
         default: "2"
       worker_count:
-        description: "Worker concurrency"
+        description: "Worker concurrency (1 to 4)"
         required: false
         default: "2"
 
 jobs:
   run-crawl:
-    name: Execute Crawl Job
+    name: Execute Ephemeral Crawl Worker
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -52,7 +56,7 @@ jobs:
         run: python -m patchright install chromium --with-deps
         if: steps.patchright-cache.outputs.cache-hit != 'true'
 
-      - name: Enqueue Seed & Run Workers
+      - name: Execute Crawl Job
         env:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -66,14 +70,17 @@ jobs:
           DATACENTER_PROXIES: ${{ secrets.DATACENTER_PROXIES }}
           RESIDENTIAL_PROXIES: ${{ secrets.RESIDENTIAL_PROXIES }}
         run: |
-          CRAWL_ID="gh-$(date +%s)"
-          echo "Launching crawl $CRAWL_ID for ${{ github.event.inputs.seed_url }}..."
-          
-          # 1. Enqueue seed via orchestrator
-          python -m app.orchestrator --url "${{ github.event.inputs.seed_url }}" --crawl-id "$CRAWL_ID" --depth ${{ github.event.inputs.max_depth }}
-          
-          # 2. Run workers until budget reached or queue drained
+          CRAWL_ID="${{ github.event.inputs.crawl_id }}"
+          if [ -z "$CRAWL_ID" ]; then
+            CRAWL_ID="gh-$(date +%s)"
+            echo "Manual trigger: Enqueuing seed ${{ github.event.inputs.seed_url }} under $CRAWL_ID..."
+            python -m app.orchestrator --url "${{ github.event.inputs.seed_url }}" --crawl-id "$CRAWL_ID" --depth ${{ github.event.inputs.max_depth }}
+          else
+            echo "API triggered: Consuming Redis tasks for existing crawl $CRAWL_ID..."
+          fi
+
           export CRAWL_ID="$CRAWL_ID"
+          echo "Starting Scrapling crawler workers for crawl ID: $CRAWL_ID..."
           python -m app.main
 
       - name: Upload Logs

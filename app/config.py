@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     DATACENTER_PROXIES: Any = ""
     RESIDENTIAL_PROXIES: Any = ""
 
+    # -----------------------------------------------------------------------
+    # GitHub Actions Dispatch Settings (Phase 8)
+    # -----------------------------------------------------------------------
+    GITHUB_REPO: str = "JohnJodinho/nexus-audit-crawler"
+    GITHUB_TOKEN: str = ""
+    GITHUB_WORKFLOW_FILE: str = "crawler_dispatch.yml"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

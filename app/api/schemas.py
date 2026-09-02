@@ -14,8 +14,14 @@ from pydantic import BaseModel, Field
 class CrawlConfig(BaseModel):
     max_pages: int = Field(default=15, ge=1, le=1000)
     max_depth: int = Field(default=2, ge=0, le=10)
-    worker_count: int = Field(default=2, ge=1, le=10)
+    worker_count: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="Worker concurrency count (must be between 1 and 4 to stay within free concurrency limits).",
+    )
     categories: Optional[List[str]] = None
+
 
 
 class CrawlCreateRequest(BaseModel):

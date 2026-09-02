@@ -57,6 +57,13 @@ async def create_crawl(
 
     cfg = payload.config.model_dump() if payload.config else {}
     cfg["crawl_id"] = crawl_id_str
+    worker_count = cfg.get("worker_count", 2)
+
+    if worker_count > 4:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"worker_count ({worker_count}) exceeds the maximum allowed limit of 4 to stay within the free runner concurrency cap.",
+        )
 
     # 1. Ensure consumer groups exist in Redis
     await ensure_consumer_group(redis, crawl_id_str)
@@ -69,7 +76,7 @@ async def create_crawl(
         target_domain=domain,
         status="queued",
         started_at=datetime.datetime.now(datetime.UTC),
-        worker_count=cfg.get("worker_count", 2),
+        worker_count=worker_count,
         config=cfg,
     )
     db.add(crawl)
@@ -84,11 +91,29 @@ async def create_crawl(
         depth=0,
     )
 
+    # 4. Automatically dispatch ephemeral crawler workers to GitHub Actions
+    from app.utils.github import dispatch_github_crawler
+
+    dispatched = await dispatch_github_crawler(
+        crawl_id=crawl_id_str,
+        seed_url=raw_url,
+        max_pages=cfg.get("max_pages", 15),
+        max_depth=cfg.get("max_depth", 2),
+        worker_count=worker_count,
+    )
+
+    msg = (
+        f"Crawl {crawl_id_str} enqueued and auto-dispatched to GitHub Actions for {raw_url}"
+        if dispatched
+        else f"Crawl {crawl_id_str} enqueued successfully for {raw_url}"
+    )
+
     return CrawlCreateResponse(
         crawl_id=crawl_id_str,
         status="queued",
-        message=f"Crawl {crawl_id_str} enqueued successfully for {raw_url}",
+        message=msg,
     )
+
 
 
 @router.get("/{crawl_id}", response_model=CrawlResponse)
