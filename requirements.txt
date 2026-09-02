@@ -1,5 +1,6 @@
 scrapling
 curl_cffi
+patchright
 playwright
 redis
 pydantic

@@ -18,7 +18,7 @@ on:
       worker_count:
         description: "Worker concurrency"
         required: false
-        default: "3"
+        default: "2"
 
 jobs:
   run-crawl:
@@ -39,6 +39,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Cache Patchright Browsers
+        uses: actions/cache@v4
+        id: patchright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-patchright-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-patchright-
+
+      - name: Install Chromium for StealthyFetcher
+        run: python -m patchright install chromium --with-deps
+        if: steps.patchright-cache.outputs.cache-hit != 'true'
+
       - name: Enqueue Seed & Run Workers
         env:
           REDIS_URL: ${{ secrets.REDIS_URL }}
@@ -50,6 +63,8 @@ jobs:
           GLOBAL_MAX_PAGES: ${{ github.event.inputs.max_pages }}
           MAX_DEPTH: ${{ github.event.inputs.max_depth }}
           WORKER_COUNT: ${{ github.event.inputs.worker_count }}
+          DATACENTER_PROXIES: ${{ secrets.DATACENTER_PROXIES }}
+          RESIDENTIAL_PROXIES: ${{ secrets.RESIDENTIAL_PROXIES }}
         run: |
           CRAWL_ID="gh-$(date +%s)"
           echo "Launching crawl $CRAWL_ID for ${{ github.event.inputs.seed_url }}..."
@@ -60,3 +75,11 @@ jobs:
           # 2. Run workers until budget reached or queue drained
           export CRAWL_ID="$CRAWL_ID"
           python -m app.main
+
+      - name: Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-logs-${{ github.run_id }}
+          path: app/logs/
+          retention-days: 14

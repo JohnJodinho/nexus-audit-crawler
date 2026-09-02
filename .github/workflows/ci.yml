@@ -26,6 +26,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Cache Patchright Browsers
+        uses: actions/cache@v4
+        id: patchright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-patchright-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-patchright-
+
+      - name: Install Chromium for StealthyFetcher
+        run: python -m patchright install chromium --with-deps
+        if: steps.patchright-cache.outputs.cache-hit != 'true'
+
       - name: Run Pytest Test Suite
         env:
           PYTHONPATH: "."
