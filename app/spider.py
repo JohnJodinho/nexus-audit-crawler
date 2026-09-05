@@ -234,7 +234,30 @@ class AuditSpider(Spider):
                 )
                 return True
 
+        # Check for unrendered Single Page Application (SPA) skeletons (React/Vue/Vite/Next.js)
+        # when fetched via primary HTTP session.
+        req_sid = getattr(getattr(response, "request", None), "sid", None) or self._SID_HTTP
+        if req_sid == self._SID_HTTP:
+            is_spa_skeleton = (
+                '<div id="root"></div>' in body_sample
+                or '<div id="root"> </div>' in body_sample
+                or '<div id="root">' in body_sample and "<a " not in body_sample
+                or '<div id="app"></div>' in body_sample
+                or '<div id="__next"></div>' in body_sample
+            )
+            if not is_spa_skeleton and len(body_sample) < 5000:
+                if ("<script" in body_sample or "/assets/" in body_sample) and "<a " not in body_sample:
+                    is_spa_skeleton = True
+
+            if is_spa_skeleton:
+                self.logger.info(
+                    "[SPA_DETECTED] Client-rendered SPA skeleton detected for %s – pivoting to stealth browser.",
+                    response.url,
+                )
+                return True
+
         return False
+
 
     async def retry_blocked_request(
         self, request: Request, response: Response

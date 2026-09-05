@@ -72,8 +72,9 @@ async def worker_loop(
     worker_id: str,
     redis: aioredis.Redis,
     crawl_id: str,
-    auto_exit_on_drain: bool = False,
+    auto_exit_on_drain: bool = True,
 ) -> None:
+
     """
     Single stateless worker coroutine. Runs until cancelled or queue is drained.
     """
@@ -511,12 +512,15 @@ async def main() -> None:
                 worker_id=f"{CONTAINER_ID}-worker-{i}",
                 redis=redis,
                 crawl_id=CRAWL_ID,
+                auto_exit_on_drain=True,
             )
             for i in range(WORKER_COUNT)
         ]
 
         log.info("[BOOTSTRAP] Launching %d worker(s)...", WORKER_COUNT)
         await asyncio.gather(*worker_coroutines)
+        log.info("[BOOTSTRAP] All workers finished. Crawl %s tasks drained.", CRAWL_ID)
+
 
     except KeyboardInterrupt:
         log.warning("KeyboardInterrupt received -- shutting down workers.")

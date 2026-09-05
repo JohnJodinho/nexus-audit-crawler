@@ -48,16 +48,17 @@ async def get_crawl_status(
     max_pages = config.get("max_pages", 15) or 15
     processed = crawl.pages_processed or 0
 
-    if crawl.status == "finished":
+    if crawl.status in ("finished", "completed"):
         progress = 1.0
         next_action = "retrieve"
-    elif crawl.status == "failed":
+    elif crawl.status in ("failed", "cancelled"):
         progress = 1.0 if processed > 0 else 0.0
         next_action = "none"
-    elif crawl.status in ("running", "queued", "draining", "consolidating"):
-        # Rough progress estimate
+    elif crawl.status in ("running", "queued", "paused", "draining", "consolidating"):
+        # Real-time progress estimate
         progress = min(0.95, round(processed / max_pages, 2)) if max_pages > 0 else 0.5
         next_action = "wait"
+
     else:
         progress = 0.0
         next_action = "none"

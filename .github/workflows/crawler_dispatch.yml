@@ -10,7 +10,7 @@ on:
       seed_url:
         description: "Seed URL to crawl and audit (if triggering manually)"
         required: false
-        default: "https://www.umgc.edu/current-students"
+        default: "https://www.jouledynamics.me"
       max_pages:
         description: "Maximum pages to crawl"
         required: false
@@ -28,7 +28,9 @@ jobs:
   run-crawl:
     name: Execute Ephemeral Crawl Worker
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+
       - name: Checkout Code
         uses: actions/checkout@v4
 

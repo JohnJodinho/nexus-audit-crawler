@@ -49,8 +49,10 @@ from app.redis_client import (
     ensure_persist_consumer_groups,
     persist_consumer_group_name,
     results_key,
+    tasks_key,
     telemetry_key,
 )
+
 from app.storage.appwrite_client import storage_client
 from app.utils.utilities import canonicalize_url, get_fingerprint
 from app.audit.rules import evaluate_findings
@@ -359,19 +361,28 @@ async def process_dlq_message(session, crawl_id: str, payload: Dict[str, Any]) -
     )
 
 
-async def persistence_loop(redis: aioredis.Redis, crawl_id: str, worker_id: str = "persist-0") -> None:
+async def persistence_loop(
+    redis: aioredis.Redis,
+    crawl_id: str,
+    worker_id: str = "persist-0",
+    auto_exit_on_drain: bool = False,
+) -> None:
     """
     Continuous persistence loop consuming results, telemetry, and DLQ streams.
+    When auto_exit_on_drain is True, detects when tasks and results streams are empty
+    and triggers automatic consolidation.
     """
     group = persist_consumer_group_name(crawl_id)
     _res_stream = results_key(crawl_id)
     _tel_stream = telemetry_key(crawl_id)
     _dlq_stream = dlq_key(crawl_id)
+    _tasks_stream = tasks_key(crawl_id)
 
     streams = {_res_stream: ">", _tel_stream: ">", _dlq_stream: ">"}
     session_factory = get_sessionmaker()
 
     log.info("[PERSIST] Listening on streams: %s (group: %s)", list(streams.keys()), group)
+    idle_count = 0
 
     while True:
         try:
@@ -388,7 +399,23 @@ async def persistence_loop(redis: aioredis.Redis, crawl_id: str, worker_id: str 
             continue
 
         if not raw_data:
+            if auto_exit_on_drain:
+                idle_count += 1
+                if idle_count >= 3:
+                    try:
+                        tasks_len = await redis.xlen(_tasks_stream)
+                        if tasks_len == 0:
+                            from app.consolidation import consolidate_crawl
+                            crawl_uuid = uuid.UUID(crawl_id) if len(crawl_id) == 36 else uuid.uuid5(uuid.NAMESPACE_DNS, crawl_id)
+                            async with session_factory() as session:
+                                await consolidate_crawl(session, crawl_uuid, crawl_id)
+                            log.info("[PERSIST] Crawl %s tasks and results drained. Auto-consolidated successfully.", crawl_id)
+                            break
+                    except Exception as drain_exc:
+                        log.debug("[PERSIST] Drain check: %s", drain_exc)
             continue
+
+        idle_count = 0
 
         for stream_name, messages in raw_data:
             if not messages:
@@ -419,7 +446,38 @@ async def persistence_loop(redis: aioredis.Redis, crawl_id: str, worker_id: str 
                             raise
 
 
+async def run_persistence_worker_for_crawl(
+    crawl_id: str,
+    worker_id: Optional[str] = None,
+    auto_exit_on_drain: bool = True,
+) -> None:
+    """
+    Dedicated background persistence consumer for a specific crawl_id.
+    Ensures persist consumer groups exist, consumes results, updates Postgres,
+    and auto-consolidates when tasks and results are drained.
+    """
+    w_id = worker_id or f"persist-{crawl_id[:8]}"
+    log.info("[PERSIST_SPAWNER] Starting persistence consumer %s for crawl %s...", w_id, crawl_id)
+    redis = create_redis_pool(max_connections=5)
+    try:
+        await ensure_persist_consumer_groups(redis, crawl_id)
+        await persistence_loop(
+            redis=redis,
+            crawl_id=crawl_id,
+            worker_id=w_id,
+            auto_exit_on_drain=auto_exit_on_drain,
+        )
+        log.info("[PERSIST_SPAWNER] Persistence consumer finished for crawl %s.", crawl_id)
+    except asyncio.CancelledError:
+        log.info("[PERSIST_SPAWNER] Persistence consumer cancelled for crawl %s.", crawl_id)
+    except Exception as exc:
+        log.error("[PERSIST_SPAWNER] Error in persistence consumer for crawl %s: %s", crawl_id, exc, exc_info=True)
+    finally:
+        await redis.aclose()
+
+
 async def main() -> None:
+
     parser = argparse.ArgumentParser(description="Durable Persistence Consumer for Audit Crawler.")
     parser.add_argument(
         "--crawl-id",

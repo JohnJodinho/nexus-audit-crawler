@@ -210,7 +210,11 @@ async def create_crawl(
         depth=0,
     )
 
-    # 6. Automatically dispatch ephemeral crawler workers to GitHub Actions
+    # 6. Immediately attach persistence consumer on Render to listen for results
+    from app.api.app import spawn_persistence_consumer_for_crawl
+    spawn_persistence_consumer_for_crawl(crawl_id_str)
+
+    # 7. Automatically dispatch ephemeral crawler workers to GitHub Actions
     dispatched = await dispatch_github_crawler(
         crawl_id=crawl_id_str,
         seed_url=canonical,
@@ -219,7 +223,7 @@ async def create_crawl(
         worker_count=worker_count,
     )
 
-    # 7. Fallback / Immediate Processing: If GitHub Actions was not dispatched (e.g. no GITHUB_TOKEN configured),
+    # 8. Fallback / Immediate Processing: If GitHub Actions was not dispatched (e.g. no GITHUB_TOKEN configured),
     # launch the background worker coroutine directly inside this container so it starts crawling immediately!
     if not dispatched:
         import asyncio
@@ -232,6 +236,7 @@ async def create_crawl(
         if dispatched
         else f"Crawl {crawl_id_str} enqueued and active background workers spawned for {canonical}"
     )
+
 
     return CrawlCreateResponse(
         crawl_id=crawl_id_str,
