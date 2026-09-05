@@ -520,6 +520,11 @@ async def main() -> None:
         log.info("[BOOTSTRAP] Launching %d worker(s)...", WORKER_COUNT)
         await asyncio.gather(*worker_coroutines)
         log.info("[BOOTSTRAP] All workers finished. Crawl %s tasks drained.", CRAWL_ID)
+        try:
+            await redis.set(f"crawl:{CRAWL_ID}:control:workers_done", "1", ex=7200)
+            log.info("[BOOTSTRAP] Set crawl:%s:control:workers_done flag.", CRAWL_ID)
+        except Exception as sig_err:
+            log.warning("[BOOTSTRAP] Could not set workers_done flag: %s", sig_err)
 
 
     except KeyboardInterrupt:

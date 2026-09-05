@@ -44,6 +44,7 @@ from app.models.schema import (
     init_db,
 )
 from app.redis_client import (
+    consumer_group_name,
     create_redis_pool,
     dlq_key,
     ensure_persist_consumer_groups,
@@ -263,11 +264,14 @@ async def process_result_message(
     for phone in phones:
         session.add(PageContact(page_id=page_id, kind="phone", value=phone))
 
-    # 5. Increment crawl pages_processed statistic
+    # 5. Increment crawl pages_processed statistic and ensure status is running
     await session.execute(
         update(Crawl)
         .where(Crawl.id == crawl_uuid)
-        .values(pages_processed=Crawl.pages_processed + 1)
+        .values(
+            pages_processed=Crawl.pages_processed + 1,
+            status="running",
+        )
     )
 
     # 6. Run deterministic audit rules and bulk-upsert findings (Phase 2)
@@ -401,10 +405,23 @@ async def persistence_loop(
         if not raw_data:
             if auto_exit_on_drain:
                 idle_count += 1
-                if idle_count >= 3:
+                if idle_count >= 2:
                     try:
-                        tasks_len = await redis.xlen(_tasks_stream)
-                        if tasks_len == 0:
+                        workers_done = bool(await redis.get(f"crawl:{crawl_id}:control:workers_done"))
+                        tasks_drained = False
+                        if not workers_done:
+                            try:
+                                w_group = consumer_group_name(crawl_id)
+                                group_info = await redis.xinfo_groups(_tasks_stream)
+                                for g in group_info:
+                                    if g.get("name") == w_group:
+                                        if g.get("pending", 1) == 0 and g.get("lag", 1) == 0:
+                                            tasks_drained = True
+                                        break
+                            except Exception:
+                                pass
+
+                        if workers_done or tasks_drained:
                             from app.consolidation import consolidate_crawl
                             crawl_uuid = uuid.UUID(crawl_id) if len(crawl_id) == 36 else uuid.uuid5(uuid.NAMESPACE_DNS, crawl_id)
                             async with session_factory() as session:

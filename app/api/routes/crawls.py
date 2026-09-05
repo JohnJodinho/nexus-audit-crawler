@@ -251,6 +251,7 @@ async def create_crawl(
 async def get_crawl(
     crawl_id: str,
     db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
 ):
     """Retrieve top-level details of a specific crawl job."""
     crawl_uuid = resolve_crawl_uuid(crawl_id)
@@ -264,11 +265,32 @@ async def get_crawl(
             detail=f"Crawl '{crawl_id}' not found.",
         )
 
+    # Auto-consolidation fail-safe if workers have finished but status not yet finished
+    if crawl.consolidated_report and crawl.status not in ("finished", "completed"):
+        crawl.status = "finished"
+    elif crawl.status not in ("finished", "completed", "failed", "cancelled"):
+        try:
+            workers_done = bool(await redis.get(f"crawl:{crawl_id}:control:workers_done"))
+            if workers_done and (crawl.pages_processed or 0) > 0:
+                from app.consolidation import consolidate_crawl
+                await consolidate_crawl(db, crawl_uuid, crawl_id)
+                res = await db.execute(stmt)
+                crawl = res.scalar_one_or_none()
+        except Exception:
+            pass
+
+    # Ensure status is running if pages processed > 0
+    current_status = crawl.status
+    if current_status == "queued" and (crawl.pages_processed or 0) > 0:
+        current_status = "running"
+    if crawl.consolidated_report:
+        current_status = "finished"
+
     return CrawlResponse(
         id=str(crawl.id),
         target_url=crawl.target_url,
         target_domain=crawl.target_domain,
-        status=crawl.status,
+        status=current_status,
         started_at=crawl.started_at,
         finished_at=crawl.finished_at,
         worker_count=crawl.worker_count,

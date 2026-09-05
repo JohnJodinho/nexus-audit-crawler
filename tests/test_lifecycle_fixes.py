@@ -169,6 +169,7 @@ async def test_persistence_consumes_result_message():
 
     crawl_id = "test-persist-dyn"
     result_stream = f"crawl:{crawl_id}:stream:audit_results"
+    mock_redis.get.return_value = "1"
 
     fake_msg = (
         "1788000000000-0",
