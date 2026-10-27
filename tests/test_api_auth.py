@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -234,17 +235,27 @@ async def test_login_rate_limit_uses_hashed_client_address_and_rejects_excess(
 
 
 @pytest.mark.asyncio
-async def test_login_rate_limit_fails_closed_when_redis_is_unavailable(monkeypatch):
+async def test_login_rate_limit_logs_redis_failure_and_fails_closed(
+    monkeypatch,
+    caplog,
+):
     redis = AsyncMock()
-    redis.eval.side_effect = RedisError("connection refused")
+    redis.eval.side_effect = RedisError("Upstash connection refused")
     monkeypatch.setattr(
         auth_rate_limit,
         "create_redis_pool",
         lambda **_kwargs: redis,
     )
 
-    with pytest.raises(HTTPException) as response:
-        await auth_rate_limit.enforce_login_rate_limit(_request())
+    with caplog.at_level(
+        logging.ERROR,
+        logger="audit_crawler.api.auth_rate_limit",
+    ):
+        with pytest.raises(HTTPException) as response:
+            await auth_rate_limit.enforce_login_rate_limit(_request())
 
     assert response.value.status_code == 503
+    assert response.value.detail == "Login is temporarily unavailable."
+    assert "Redis-backed login rate limit failed" in caplog.text
+    assert "Upstash connection refused" in caplog.text
     redis.aclose.assert_awaited_once()

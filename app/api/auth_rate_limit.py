@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from fastapi import HTTPException, Request, status
 from redis.exceptions import RedisError
 
 from app.redis_client import create_redis_pool
+
+log = logging.getLogger("audit_crawler.api.auth_rate_limit")
 
 _ATTEMPT_LIMIT = 10
 _WINDOW_SECONDS = 60
@@ -33,6 +36,7 @@ async def enforce_login_rate_limit(request: Request) -> None:
             _WINDOW_SECONDS,
         )
     except RedisError as exc:
+        log.exception("Redis-backed login rate limit failed")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Login is temporarily unavailable.",
