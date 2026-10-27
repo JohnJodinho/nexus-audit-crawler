@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.event_log import append_crawl_event
 from app.models.schema import (
     Crawl,
     DeadLetterTask,
@@ -196,6 +197,17 @@ async def consolidate_crawl(
                 pages_failed=pages_failed,
                 config=existing_config,
             )
+        )
+        await append_crawl_event(
+            session,
+            crawl_uuid,
+            "crawl.completed",
+            {
+                "crawl_id": crawl_id,
+                "status": "finished",
+                "pages_processed": pages_processed,
+                "pages_failed": pages_failed,
+            },
         )
         await session.commit()
 

@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from app.api.app import create_app
+from app.api.auth import Principal, require_authenticated_principal
 from app.api.deps import get_db, get_redis, resolve_crawl_uuid
 from app.models.schema import Crawl
 from app.persistence_worker import persistence_loop
@@ -62,8 +64,18 @@ async def client(mock_db_session: AsyncMock, test_redis) -> AsyncGenerator[Async
     async def override_get_redis():
         yield test_redis
 
+    async def override_auth(request: Request):
+        principal = Principal(subject="test-operator", actor_type="operator")
+        request.state.principal = principal
+        return principal
+
+    async def override_audit(*_args):
+        return None
+
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis] = override_get_redis
+    app.dependency_overrides[require_authenticated_principal] = override_auth
+    app.state.audit_action_writer = override_audit
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -192,14 +204,26 @@ async def test_persistence_consumes_result_message():
     ]
     mock_redis.xlen.return_value = 0
 
+    transaction_committed = False
+
     class AsyncContextManagerMock:
         async def __aenter__(self):
             return self
         async def __aexit__(self, exc_type, exc_val, exc_tb):
-            pass
+            nonlocal transaction_committed
+            transaction_committed = True
 
     mock_session = AsyncMock()
+    event_result = MagicMock()
+    event_result.scalar_one_or_none.return_value = 456
+    mock_session.execute = AsyncMock(return_value=event_result)
     mock_session.begin = MagicMock(return_value=AsyncContextManagerMock())
+
+    async def ack_after_commit(*_args):
+        assert transaction_committed is True
+        return 1
+
+    mock_redis.xack.side_effect = ack_after_commit
 
     class SessionFactoryMock:
         def __call__(self):

@@ -219,6 +219,51 @@ class DeadLetterTask(Base):
     failed_at_utc: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=func.now())
 
 
+class CrawlApiEvent(Base):
+    """Durable, replayable change notification for the management API."""
+
+    __tablename__ = "crawl_api_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    crawl_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
+class ApiActionAudit(Base):
+    """One-year audit trail for authenticated API mutations."""
+
+    __tablename__ = "api_action_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    actor_subject: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    crawl_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    finding_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    response_status: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
+class ProcessedStreamMessage(Base):
+    """Durable idempotency marker for a committed Redis persistence message."""
+
+    __tablename__ = "processed_stream_messages"
+
+    stream_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    message_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    processed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 async def init_db(engine=None) -> None:
     """Create all tables idempotently if they do not already exist."""
     from app.db.engine import get_engine

@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # Database & Blob Storage (Phase 2)
     # -----------------------------------------------------------------------
     DATABASE_URL: str = ""
+    DATABASE_LISTEN_URL: str = ""
+
+    # -----------------------------------------------------------------------
+    # API Authentication & Browser Access
+    # -----------------------------------------------------------------------
+    API_OPERATOR_USERNAME: str = ""
+    API_OPERATOR_PASSWORD_HASH: str = ""
+    API_TOKEN_SECRET: str = ""
+    API_CORS_ORIGINS: str = "https://console.jouledynamics.me"
 
     APP_WRITE_PROJECT_ID: str = ""
     APP_WRITE_API_ENDPOINT: str = "https://cloud.appwrite.io/v1"
@@ -74,6 +83,11 @@ class Settings(BaseSettings):
     GITHUB_REPO: str = "JohnJodinho/nexus-audit-crawler"
     GITHUB_TOKEN: str = ""
     GITHUB_WORKFLOW_FILE: str = "crawler_dispatch.yml"
+
+    @property
+    def api_cors_origins(self) -> List[str]:
+        """Return the explicitly configured browser origins."""
+        return [origin.strip() for origin in self.API_CORS_ORIGINS.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(
         env_file=".env",

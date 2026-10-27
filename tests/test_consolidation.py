@@ -88,6 +88,8 @@ async def test_consolidate_crawl_full_rollup():
         mock_links_res,      # page_links anchor links
         mock_crawl_res,      # select Crawl
         MagicMock(),         # update Crawl
+        MagicMock(),         # insert API event
+        MagicMock(),         # pg_notify wake-up
     ]
 
     # Execute consolidation

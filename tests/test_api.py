@@ -14,10 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 import fakeredis.aioredis
 
 from app.api.app import create_app
+from app.api.auth import Principal, require_authenticated_principal
 from app.api.deps import get_db, get_redis, resolve_crawl_uuid
 from app.models.schema import AuditFinding, Crawl, Page, PageContact
 
@@ -51,8 +53,18 @@ async def client(mock_db_session: AsyncMock, test_redis) -> AsyncGenerator[Async
     async def override_get_redis():
         yield test_redis
 
+    async def override_auth(request: Request):
+        principal = Principal(subject="test-operator", actor_type="operator")
+        request.state.principal = principal
+        return principal
+
+    async def override_audit(*_args):
+        return None
+
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis] = override_get_redis
+    app.dependency_overrides[require_authenticated_principal] = override_auth
+    app.state.audit_action_writer = override_audit
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -70,6 +82,105 @@ async def test_health_check(client: AsyncClient):
     data = resp.json()
     assert data["status"] == "healthy"
     assert data["service"] == "nexus-audit-crawler-api"
+
+
+@pytest.mark.asyncio
+async def test_crawl_routes_reject_missing_bearer_token():
+    app = create_app()
+    routes = [
+        ("GET", "/api/crawls"),
+        ("GET", "/api/crawls/example"),
+        ("GET", "/api/crawls/example/status"),
+        ("GET", "/api/crawls/example/telemetry"),
+        ("GET", "/api/crawls/example/graph"),
+        ("GET", "/api/crawls/example/findings"),
+        ("GET", "/api/crawls/example/pages"),
+        ("GET", "/api/crawls/example/summary"),
+        ("GET", "/api/events"),
+        ("POST", "/api/crawls"),
+        ("POST", "/api/crawls/example/pause"),
+        ("PATCH", "/api/crawls/example/findings/1"),
+        ("DELETE", "/api/crawls/example"),
+    ]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        for method, path in routes:
+            response = await ac.request(method, path, json={} if method in {"POST", "PATCH"} else None)
+            assert response.status_code == 401, (method, path, response.text)
+
+        assert (await ac.get("/health")).status_code == 200
+
+    for path, operations in app.openapi()["paths"].items():
+        if path.startswith("/api/") and path != "/api/auth/login":
+            for operation in operations.values():
+                assert {"BearerAuth": []} in operation.get("security", [])
+    assert "security" not in app.openapi()["paths"]["/api/auth/login"]["post"]
+
+
+@pytest.mark.asyncio
+async def test_cors_allows_configured_console_and_rejects_other_origins():
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        allowed = await ac.options(
+            "/api/crawls",
+            headers={
+                "Origin": "https://console.jouledynamics.me",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        assert allowed.status_code == 200
+        assert allowed.headers["access-control-allow-origin"] == "https://console.jouledynamics.me"
+        assert "access-control-allow-credentials" not in allowed.headers
+
+        rejected = await ac.options(
+            "/api/crawls",
+            headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert "access-control-allow-origin" not in rejected.headers
+
+
+@pytest.mark.asyncio
+async def test_mutation_middleware_audits_authenticated_target_and_outcome(test_redis):
+    app = create_app()
+    session = AsyncMock()
+    lookup = MagicMock()
+    lookup.scalar_one_or_none.return_value = None
+    session.execute.return_value = lookup
+    principal = Principal(subject="test-operator", actor_type="operator")
+    audit_writer = AsyncMock()
+
+    async def override_get_db():
+        yield session
+
+    async def override_get_redis():
+        yield test_redis
+
+    async def override_auth(request: Request):
+        request.state.principal = principal
+        return principal
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_redis] = override_get_redis
+    app.dependency_overrides[require_authenticated_principal] = override_auth
+    app.state.audit_action_writer = audit_writer
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.delete("/api/crawls/missing")
+
+    assert response.status_code == 404
+    audit_writer.assert_awaited_once_with(
+        principal,
+        "DELETE /api/crawls/missing",
+        "missing",
+        None,
+        404,
+    )
 
 
 @pytest.mark.asyncio
@@ -689,12 +800,13 @@ async def test_delete_crawl(client: AsyncClient, mock_db_session: AsyncMock, tes
     res_crawl.scalar_one_or_none.return_value = mock_crawl
     res_pages = MagicMock()
     res_pages.scalars.return_value.all.return_value = []
+    res_event = MagicMock()
+    res_event.scalar_one_or_none.return_value = 123
 
-    mock_db_session.execute.side_effect = [res_crawl, res_pages]
+    mock_db_session.execute.side_effect = [res_crawl, res_pages, res_event, MagicMock()]
 
     resp = await client.delete(f"/api/crawls/{crawl_id}")
     assert resp.status_code == 200
     data = resp.json()
     assert data["action"] == "deleted"
     mock_db_session.delete.assert_called_once_with(mock_crawl)
-

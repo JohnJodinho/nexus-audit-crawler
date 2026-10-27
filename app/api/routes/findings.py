@@ -14,6 +14,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, resolve_crawl_uuid
+from app.api.event_log import append_crawl_event
 from app.api.schemas import (
     AuditFindingResponse,
     FindingUpdateRequest,
@@ -147,14 +148,22 @@ async def update_finding_status(
         .returning(AuditFinding)
     )
     res = await db.execute(update_stmt)
-    await db.commit()
     f = res.scalar_one_or_none()
 
     if not f:
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Finding '{finding_id}' not found for crawl '{crawl_id}'.",
         )
+
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "finding.status_changed",
+        {"crawl_id": crawl_id, "finding_id": finding_id, "status": payload.status},
+    )
+    await db.commit()
 
     return AuditFindingResponse(
         id=f.id,

@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_redis, resolve_crawl_uuid
+from app.api.event_log import append_crawl_event
 from app.api.schemas import CrawlControlResponse
 from app.consolidation import consolidate_crawl
 from app.models.schema import Crawl, DeadLetterTask
@@ -71,6 +72,12 @@ async def cancel_crawl(
     # 3. Update DB status
     crawl.status = "cancelled"
     crawl.finished_at = datetime.datetime.now(datetime.UTC)
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.status_changed",
+        {"crawl_id": crawl_id, "from": prev_status, "to": "cancelled"},
+    )
     await db.commit()
 
     log.info("[LIFECYCLE] Cancelled crawl %s (was: %s)", crawl_id, prev_status)
@@ -117,6 +124,12 @@ async def pause_crawl(
 
     # 2. Update DB status
     crawl.status = "paused"
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.status_changed",
+        {"crawl_id": crawl_id, "from": prev_status, "to": "paused"},
+    )
     await db.commit()
 
     log.info("[LIFECYCLE] Paused crawl %s", crawl_id)
@@ -163,6 +176,12 @@ async def resume_crawl(
 
     # 2. Update DB status
     crawl.status = "running"
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.status_changed",
+        {"crawl_id": crawl_id, "from": prev_status, "to": "running"},
+    )
     await db.commit()
 
     log.info("[LIFECYCLE] Resumed crawl %s", crawl_id)
@@ -271,6 +290,12 @@ async def retry_failed_tasks(
     if crawl.status in ("completed", "cancelled"):
         crawl.status = "running"
 
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.tasks_retried",
+        {"crawl_id": crawl_id, "requeued_count": requeued},
+    )
     await db.commit()
 
     log.info("[LIFECYCLE] Requeued %d DLQ tasks for crawl %s", requeued, crawl_id)

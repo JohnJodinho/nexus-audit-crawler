@@ -144,6 +144,26 @@ Copy `.env.example` to `.env` and fill in your credentials:
 cp .env.example .env
 ```
 
+The API owns operator sign-in; no third-party identity provider is used.
+Generate a password hash with `python -m scripts.generate_api_password_hash`
+and a signing secret with
+`python -c "import secrets; print(secrets.token_urlsafe(48))"`. Configure
+`API_OPERATOR_USERNAME`, `API_OPERATOR_PASSWORD_HASH`, and `API_TOKEN_SECRET`
+in the environment or secret manager. The public `POST /api/auth/login` endpoint
+checks the credentials and returns a signed bearer token valid for 15 minutes.
+The console must keep that token in memory only, not in local or session
+storage; a reload or token expiry requires signing in again. Login attempts are
+rate-limited through Redis. Protected API routes fail closed until the
+credentials and signing secret are configured; `/health` remains public.
+
+Set `API_CORS_ORIGINS` to the exact allowed browser origins (production defaults
+to `https://console.jouledynamics.me`; add a local development origin explicitly
+when needed). CORS is not an authentication boundary.
+
+For SSE, use `DATABASE_LISTEN_URL` when the normal database URL uses a
+transaction-mode pooler. The listener URL must use a direct or session-mode
+PostgreSQL connection because SSE requires a persistent `LISTEN` connection.
+
 ### 4. Initialize Database Tables
 ```bash
 python scripts/init_db.py
@@ -161,6 +181,10 @@ Interactive Swagger docs available at `http://localhost:8000/docs`.
 ```bash
 python -m app.persistence_worker --crawl-id default
 ```
+The worker commits each result together with its event notification and a
+message-id marker before acknowledging the Redis stream entry. This makes
+redelivery after an acknowledgement failure idempotent; the marker table grows
+with the number of successfully persisted stream messages.
 
 **Run Crawler Workers:**
 ```bash
@@ -191,7 +215,10 @@ docker run -p 8000:8000 --env-file .env nexus-audit-crawler
 This repository includes a [`render.yaml`](render.yaml) Blueprint:
 1. Go to [Render Dashboard](https://dashboard.render.com/) → **Blueprints** → **New Blueprint Instance**.
 2. Select this repository.
-3. Provide your environment variables (`REDIS_URL`, `DATABASE_URL`, `APP_WRITE_*`).
+3. Provide your environment variables (`REDIS_URL`, `DATABASE_URL`, `APP_WRITE_*`,
+   `API_OPERATOR_USERNAME`, `API_OPERATOR_PASSWORD_HASH`, `API_TOKEN_SECRET`,
+   and `API_CORS_ORIGINS`). Configure `DATABASE_LISTEN_URL` if `DATABASE_URL`
+   is not a direct or session-mode PostgreSQL connection.
 4. Render will automatically spin up the `nexus-query-api` Web Service and `nexus-persistence-worker` Background Worker.
 
 ---

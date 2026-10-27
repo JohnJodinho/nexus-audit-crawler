@@ -19,6 +19,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_redis, resolve_crawl_uuid
+from app.api.event_log import append_crawl_event
 from app.api.schemas import (
     CrawlControlResponse,
     CrawlCreateRequest,
@@ -199,6 +200,12 @@ async def create_crawl(
         config=cfg,
     )
     db.add(crawl)
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.created",
+        {"crawl_id": crawl_id_str, "status": "queued"},
+    )
     await db.commit()
 
     # 5. Publish seed URL to Redis task stream
@@ -328,6 +335,12 @@ async def delete_crawl(
 
     # 1. Cascade delete all DB children
     await db.execute(select(Page).where(Page.crawl_id == crawl_uuid))
+    await append_crawl_event(
+        db,
+        crawl_uuid,
+        "crawl.deleted",
+        {"crawl_id": crawl_id, "previous_status": prev_status},
+    )
     # ORM cascade takes care of Page, AuditFinding, PageContact, DeadLetterTask, DroppedTelemetry
     await db.delete(crawl)
     await db.commit()
@@ -349,4 +362,3 @@ async def delete_crawl(
         message=f"Crawl '{crawl_id}' and all associated pages, findings, telemetry, and Redis keys were permanently purged.",
         details={"status": "purged"},
     )
-

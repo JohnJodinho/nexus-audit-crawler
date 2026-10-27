@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from app.models.schema import Crawl, Page, PageContact, DroppedTelemetry, DeadLetterTask
+from app.persistence_support import claim_stream_message
 from app.persistence_worker import (
     ensure_crawl_record,
     process_result_message,
@@ -120,3 +121,27 @@ async def test_process_dlq_message_with_mock_session():
     added_obj = mock_session.add.call_args[0][0]
     assert isinstance(added_obj, DeadLetterTask)
     assert added_obj.dlq_reason == "max_retries_exceeded_in_pel"
+
+
+@pytest.mark.asyncio
+async def test_claim_stream_message_is_idempotent():
+    mock_session = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = "1788000000000-0"
+    mock_session.execute.return_value = result
+
+    claimed = await claim_stream_message(
+        mock_session,
+        "crawl:test:stream:audit_results",
+        "1788000000000-0",
+    )
+
+    assert claimed is True
+    result.scalar_one_or_none.return_value = None
+    duplicate_claim = await claim_stream_message(
+        mock_session,
+        "crawl:test:stream:audit_results",
+        "1788000000000-0",
+    )
+    assert duplicate_claim is False
+    assert mock_session.execute.await_count == 2

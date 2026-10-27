@@ -11,13 +11,20 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from typing import Dict
 
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.api.auth import require_authenticated_principal
+from app.api.audit import write_action_audit
+from app.api.maintenance import run_api_retention_cleanup
 from app.api.routes import (
+    auth,
     control,
     crawls,
+    events,
     findings,
     graph,
     pages,
@@ -37,6 +44,25 @@ log = logging.getLogger("audit_crawler.api")
 
 # Active persistence consumer tasks registry: crawl_id -> asyncio.Task
 _active_persistence_tasks: Dict[str, asyncio.Task] = {}
+
+
+def _is_auditable_mutation(request: Request, principal: object | None) -> bool:
+    return bool(
+        principal is not None
+        and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.url.path.startswith("/api/")
+    )
+
+
+def _audit_resource_ids(request: Request) -> tuple[str | None, str | None]:
+    segments = [segment for segment in request.url.path.split("/") if segment]
+    crawl_id = segments[2] if len(segments) > 2 and segments[1] == "crawls" else None
+    finding_id = None
+    if "findings" in segments:
+        finding_index = segments.index("findings")
+        if finding_index + 1 < len(segments):
+            finding_id = segments[finding_index + 1]
+    return crawl_id, finding_id
 
 
 def spawn_persistence_consumer_for_crawl(crawl_id: str) -> None:
@@ -103,6 +129,7 @@ async def lifespan(app: FastAPI):
 
     # 2. Start multi-tenant persistence manager
     manager_task: asyncio.Task | None = None
+    retention_task = asyncio.create_task(run_api_retention_cleanup())
     should_run_worker = os.getenv("RUN_EMBEDDED_WORKER", "true").lower() in ("true", "1", "yes")
 
     if should_run_worker:
@@ -115,6 +142,13 @@ async def lifespan(app: FastAPI):
         manager_task.cancel()
         try:
             await asyncio.wait_for(manager_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    if not retention_task.done():
+        retention_task.cancel()
+        try:
+            await asyncio.wait_for(retention_task, timeout=5.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
@@ -134,25 +168,69 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.state.audit_action_writer = write_action_audit
 
-    # CORS configuration -- allowing frontend dev environments
+    # Browser access is limited to the configured console origins.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=settings.api_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
     )
 
-    # Mount API routers
-    app.include_router(crawls.router, prefix="/api/crawls", tags=["Crawls"])
-    app.include_router(status_route.router, prefix="/api/crawls", tags=["Status"])
-    app.include_router(control.router, prefix="/api/crawls", tags=["Lifecycle Control"])
-    app.include_router(telemetry.router, prefix="/api/crawls", tags=["Telemetry & DLQ"])
-    app.include_router(graph.router, prefix="/api/crawls", tags=["Graph & Export"])
-    app.include_router(findings.router, prefix="/api/crawls", tags=["Findings"])
-    app.include_router(pages.router, prefix="/api/crawls", tags=["Pages"])
-    app.include_router(summary.router, prefix="/api/crawls", tags=["Summary"])
+    # Every crawl-data and action route shares the same API-side authorization.
+    protected_router_options = {
+        "prefix": "/api/crawls",
+        "dependencies": [Depends(require_authenticated_principal)],
+    }
+    app.include_router(crawls.router, tags=["Crawls"], **protected_router_options)
+    app.include_router(status_route.router, tags=["Status"], **protected_router_options)
+    app.include_router(control.router, tags=["Lifecycle Control"], **protected_router_options)
+    app.include_router(telemetry.router, tags=["Telemetry & DLQ"], **protected_router_options)
+    app.include_router(graph.router, tags=["Graph & Export"], **protected_router_options)
+    app.include_router(findings.router, tags=["Findings"], **protected_router_options)
+    app.include_router(pages.router, tags=["Pages"], **protected_router_options)
+    app.include_router(summary.router, tags=["Summary"], **protected_router_options)
+    app.include_router(
+        events.router,
+        prefix="/api",
+        tags=["Events"],
+        dependencies=[Depends(require_authenticated_principal)],
+    )
+    app.include_router(auth.router)
+
+    async def write_request_audit(request: Request, response_status: int) -> None:
+        principal = getattr(request.state, "principal", None)
+        if not _is_auditable_mutation(request, principal):
+            return
+
+        crawl_id, finding_id = _audit_resource_ids(request)
+        try:
+            await request.app.state.audit_action_writer(
+                principal,
+                f"{request.method} {request.url.path}",
+                crawl_id,
+                finding_id,
+                response_status,
+            )
+        except (SQLAlchemyError, OSError, ValueError) as exc:
+            log.error(
+                "Could not persist API action audit (%s) for %s.",
+                type(exc).__name__,
+                request.method,
+            )
+
+    @app.middleware("http")
+    async def audit_mutating_requests(request: Request, call_next):
+        try:
+            response = await call_next(request)
+        except Exception:
+            await write_request_audit(request, 500)
+            raise
+
+        await write_request_audit(request, response.status_code)
+        return response
 
     @app.get("/", tags=["Health"])
     @app.get("/health", tags=["Health"])

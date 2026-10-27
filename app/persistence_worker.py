@@ -25,11 +25,10 @@ import datetime
 import json
 import logging
 import sys
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import redis.asyncio as aioredis
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
@@ -37,14 +36,18 @@ from app.db.engine import get_sessionmaker
 from app.models.schema import (
     AuditFinding,
     Crawl,
-    DeadLetterTask,
-    DroppedTelemetry,
     Page,
     PageContact,
     init_db,
 )
+from app.persistence_support import (
+    ensure_crawl_record,
+    handle_empty_read as _handle_empty_read,
+    persist_stream_batch as _persist_stream_batch,
+    process_dlq_message,
+    process_telemetry_message,
+)
 from app.redis_client import (
-    consumer_group_name,
     create_redis_pool,
     dlq_key,
     ensure_persist_consumer_groups,
@@ -62,33 +65,6 @@ log = logging.getLogger("audit_crawler.persist")
 
 _BATCH_SIZE: int = 10
 _BLOCK_MS: int = 2_000
-
-
-async def ensure_crawl_record(session, crawl_id_str: str, domain: str = "", target_url: str = "") -> uuid.UUID:
-    """Ensure a row in `crawls` exists for this crawl_id."""
-    try:
-        crawl_uuid = uuid.UUID(crawl_id_str)
-    except ValueError:
-        # Fallback to deterministic UUID from string namespace if string is not valid UUID
-        crawl_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, crawl_id_str)
-
-    stmt = select(Crawl).where(Crawl.id == crawl_uuid)
-    result = await session.execute(stmt)
-    crawl = result.scalar_one_or_none()
-
-    if crawl is None:
-        crawl = Crawl(
-            id=crawl_uuid,
-            target_url=target_url or f"https://{domain or 'example.com'}",
-            target_domain=domain or "example.com",
-            status="running",
-            started_at=datetime.datetime.now(datetime.UTC),
-            config={"crawl_id": crawl_id_str, "crawl_id_alias": crawl_id_str},
-        )
-        session.add(crawl)
-        await session.flush()
-
-    return crawl_uuid
 
 
 async def process_result_message(
@@ -332,39 +308,6 @@ async def process_result_message(
     )
 
 
-async def process_telemetry_message(session, crawl_id: str, payload: Dict[str, Any]) -> None:
-    """Process a link drop telemetry message."""
-    crawl_uuid = await ensure_crawl_record(session, crawl_id)
-    session.add(
-        DroppedTelemetry(
-            crawl_id=crawl_uuid,
-            source_url=payload.get("source_url"),
-            target_url=payload.get("target_url"),
-            drop_reason=payload.get("drop_reason", "UNKNOWN"),
-            timestamp_utc=datetime.datetime.now(datetime.UTC),
-        )
-    )
-
-
-async def process_dlq_message(session, crawl_id: str, payload: Dict[str, Any]) -> None:
-    """Process a dead-letter queue message."""
-    crawl_uuid = await ensure_crawl_record(session, crawl_id)
-    session.add(
-        DeadLetterTask(
-            crawl_id=crawl_uuid,
-            url=payload.get("url"),
-            dlq_reason=payload.get("dlq_reason", "unknown_error"),
-            task_fields=payload,
-            failed_at_utc=datetime.datetime.now(datetime.UTC),
-        )
-    )
-    await session.execute(
-        update(Crawl)
-        .where(Crawl.id == crawl_uuid)
-        .values(pages_failed=Crawl.pages_failed + 1)
-    )
-
-
 async def persistence_loop(
     redis: aioredis.Redis,
     crawl_id: str,
@@ -403,33 +346,16 @@ async def persistence_loop(
             continue
 
         if not raw_data:
-            if auto_exit_on_drain:
-                idle_count += 1
-                if idle_count >= 2:
-                    try:
-                        workers_done = bool(await redis.get(f"crawl:{crawl_id}:control:workers_done"))
-                        tasks_drained = False
-                        if not workers_done:
-                            try:
-                                w_group = consumer_group_name(crawl_id)
-                                group_info = await redis.xinfo_groups(_tasks_stream)
-                                for g in group_info:
-                                    if g.get("name") == w_group:
-                                        if g.get("pending", 1) == 0 and g.get("lag", 1) == 0:
-                                            tasks_drained = True
-                                        break
-                            except Exception:
-                                pass
-
-                        if workers_done or tasks_drained:
-                            from app.consolidation import consolidate_crawl
-                            crawl_uuid = uuid.UUID(crawl_id) if len(crawl_id) == 36 else uuid.uuid5(uuid.NAMESPACE_DNS, crawl_id)
-                            async with session_factory() as session:
-                                await consolidate_crawl(session, crawl_uuid, crawl_id)
-                            log.info("[PERSIST] Crawl %s tasks and results drained. Auto-consolidated successfully.", crawl_id)
-                            break
-                    except Exception as drain_exc:
-                        log.debug("[PERSIST] Drain check: %s", drain_exc)
+            idle_count, should_exit = await _handle_empty_read(
+                redis,
+                session_factory,
+                crawl_id,
+                _tasks_stream,
+                auto_exit_on_drain,
+                idle_count,
+            )
+            if should_exit:
+                break
             continue
 
         idle_count = 0
@@ -438,29 +364,20 @@ async def persistence_loop(
             if not messages:
                 continue
 
-            async with session_factory() as session:
-                async with session.begin():
-                    for message_id, payload in messages:
-                        try:
-                            if stream_name == _res_stream:
-                                await process_result_message(session, crawl_id, message_id, payload)
-                            elif stream_name == _tel_stream:
-                                await process_telemetry_message(session, crawl_id, payload)
-                            elif stream_name == _dlq_stream:
-                                await process_dlq_message(session, crawl_id, payload)
-
-                            # XACK on message success after commit
-                            await redis.xack(stream_name, group, message_id)
-                        except Exception as msg_exc:
-                            log.error(
-                                "[PERSIST] Error processing msg %s from %s: %s",
-                                message_id,
-                                stream_name,
-                                msg_exc,
-                                exc_info=True,
-                            )
-                            # Rollback transaction for this batch; uncommitted messages will remain in PEL
-                            raise
+            await _persist_stream_batch(
+                redis,
+                session_factory,
+                crawl_id,
+                group,
+                stream_name,
+                messages,
+                _res_stream,
+                _tel_stream,
+                _dlq_stream,
+                process_result_message,
+                process_telemetry_message,
+                process_dlq_message,
+            )
 
 
 async def run_persistence_worker_for_crawl(

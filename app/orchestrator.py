@@ -39,6 +39,7 @@ import anyio
 import redis.asyncio as aioredis
 from sqlalchemy import select
 
+from app.api.event_log import append_crawl_event
 from app.redis_client import (
     MAX_RETRIES,
     PEL_TIMEOUT_MS,
@@ -412,7 +413,14 @@ async def run_crawl_consolidation(crawl_id: str) -> Optional[dict]:
             return crawl.config.get("consolidation") if crawl.config else {}
 
         # Set status to consolidating
+        previous_status = crawl.status
         crawl.status = "consolidating"
+        await append_crawl_event(
+            session,
+            crawl.id,
+            "crawl.status_changed",
+            {"crawl_id": crawl_id, "from": previous_status, "to": "consolidating"},
+        )
         await session.commit()
 
         # Run consolidation

@@ -22,6 +22,7 @@ appwrite
 fastapi
 uvicorn
 httpx
+PyJWT>=2.8,<3
 mcp<2
 
 # Testing
