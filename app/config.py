@@ -59,7 +59,11 @@ class Settings(BaseSettings):
     API_OPERATOR_USERNAME: str = ""
     API_OPERATOR_PASSWORD_HASH: str = ""
     API_TOKEN_SECRET: str = ""
-    API_CORS_ORIGINS: str = "https://console.jouledynamics.me"
+    API_CORS_ORIGINS: str = (
+        "https://console.jouledynamics.me,"
+        "http://localhost:5173,"
+        "http://localhost:5174"
+    )
 
     APP_WRITE_PROJECT_ID: str = ""
     APP_WRITE_API_ENDPOINT: str = "https://cloud.appwrite.io/v1"
