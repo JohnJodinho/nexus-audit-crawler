@@ -1,4 +1,4 @@
-"""Authenticated SSE endpoint for durable crawl change events."""
+"""Authenticated SSE endpoint for durable crawl change events with multi-transport wakeups."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from app.api.event_log import NOTIFY_CHANNEL
 from app.config import settings
 from app.db.engine import get_sessionmaker
 from app.models.schema import CrawlApiEvent
+from app.redis_client import create_redis_pool, events_channel
 
 log = logging.getLogger("audit_crawler.api.events")
 
@@ -92,14 +93,43 @@ async def _wait_for_event(wake_event: asyncio.Event) -> bool:
         return True
 
 
-async def _close_event_stream(
-    connection: asyncpg.Connection,
-    listener_callback: Callable[..., None],
-) -> None:
+async def _redis_event_listener(redis_client, crawl_id: str | None, wake_event: asyncio.Event) -> None:
+    """Listen for real-time events published via Redis Pub/Sub."""
     try:
-        await connection.remove_listener(NOTIFY_CHANNEL, listener_callback)
-    finally:
-        await connection.close()
+        pubsub = redis_client.pubsub()
+        channels = [events_channel(None)]
+        if crawl_id:
+            channels.append(events_channel(crawl_id))
+        await pubsub.subscribe(*channels)
+        async for _ in pubsub.listen():
+            wake_event.set()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log.debug("Redis SSE listener ended: %s", exc)
+
+
+async def _close_event_stream(
+    connection: asyncpg.Connection | None,
+    listener_callback: Callable[..., None] | None,
+    redis_task: asyncio.Task | None = None,
+    redis_client = None,
+) -> None:
+    if redis_task is not None and not redis_task.done():
+        redis_task.cancel()
+    if redis_client is not None:
+        try:
+            await redis_client.aclose()
+        except Exception:
+            pass
+
+    if connection is not None and listener_callback is not None:
+        try:
+            await connection.remove_listener(NOTIFY_CHANNEL, listener_callback)
+        except Exception:
+            pass
+        finally:
+            await connection.close()
 
 
 async def _read_events(
@@ -123,15 +153,17 @@ async def _read_events(
 
 
 async def _event_stream(
-    connection: asyncpg.Connection,
+    connection: asyncpg.Connection | None,
     wake_event: asyncio.Event,
-    listener_callback: Callable[..., None],
+    listener_callback: Callable[..., None] | None,
     session_factory,
     crawl_uuid,
     after_id: int,
     *,
     ready_cursor: int | None,
     resync_required: bool,
+    redis_task: asyncio.Task | None = None,
+    redis_client = None,
 ) -> AsyncIterator[str]:
     try:
         initial_frame, after_id = _initial_frame(after_id, ready_cursor, resync_required)
@@ -156,7 +188,7 @@ async def _event_stream(
             if await _wait_for_event(wake_event):
                 yield ": keep-alive\n\n"
     finally:
-        await _close_event_stream(connection, listener_callback)
+        await _close_event_stream(connection, listener_callback, redis_task, redis_client)
 
 
 def _parse_event_cursor(last_event_id: str | None) -> int | None:
@@ -222,8 +254,10 @@ def _cursor_expired(cursor: int | None, earliest_id: int | None) -> bool:
 
 
 @router.get("/events", tags=["Events"])
+@router.get("/crawls/{crawl_id}/events", tags=["Events"])
+@router.get("/crawls/{crawl_id}/events/stream", tags=["Events"])
 async def stream_crawl_events(
-    crawl_id: str | None = Query(None, description="Optional crawl ID filter"),
+    crawl_id: str | None = None,
     last_event_id: str | None = Header(None, alias="Last-Event-ID"),
 ):
     """Stream durable crawl-change notifications and replay events after a cursor."""
@@ -235,9 +269,28 @@ async def stream_crawl_events(
         wake_event.set()
 
     connection: asyncpg.Connection | None = None
+    redis_client = None
+    redis_task: asyncio.Task | None = None
+
     try:
-        connection = await asyncpg.connect(dsn=_listener_dsn(), timeout=5)
-        await connection.add_listener(NOTIFY_CHANNEL, notify_callback)
+        # 1. Try PostgreSQL LISTEN
+        try:
+            connection = await asyncpg.connect(dsn=_listener_dsn(), timeout=5)
+            await connection.add_listener(NOTIFY_CHANNEL, notify_callback)
+        except Exception as db_listen_exc:
+            log.warning("PostgreSQL LISTEN not available (e.g. transaction pooler): %s", db_listen_exc)
+            connection = None
+
+        # 2. Redis pub/sub listener (works seamlessly across all environments)
+        try:
+            redis_client = create_redis_pool()
+            redis_task = asyncio.create_task(_redis_event_listener(redis_client, crawl_id, wake_event))
+        except Exception as redis_exc:
+            log.warning("Redis SSE listener setup: %s", redis_exc)
+
+        if connection is None and redis_client is None:
+            raise RuntimeError("No event notification transport available.")
+
         session_factory = get_sessionmaker()
         earliest_id, latest_id = await _event_cursor_window(session_factory)
         after_id, ready_cursor, resync_required = _cursor_state(
@@ -246,10 +299,10 @@ async def stream_crawl_events(
             latest_id,
         )
     except HTTPException:
-        await _close_listener(connection)
+        await _close_event_stream(connection, notify_callback if connection else None, redis_task, redis_client)
         raise
-    except (asyncpg.PostgresError, OSError, TimeoutError, SQLAlchemyError, ValueError) as exc:
-        await _close_listener(connection)
+    except (asyncpg.PostgresError, OSError, TimeoutError, SQLAlchemyError, ValueError, RuntimeError) as exc:
+        await _close_event_stream(connection, notify_callback if connection else None, redis_task, redis_client)
         log.error("Unable to initialize SSE event stream (%s).", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -260,12 +313,14 @@ async def stream_crawl_events(
         _event_stream(
             connection,
             wake_event,
-            notify_callback,
+            notify_callback if connection else None,
             session_factory,
             crawl_uuid,
             after_id,
             ready_cursor=ready_cursor,
             resync_required=resync_required,
+            redis_task=redis_task,
+            redis_client=redis_client,
         ),
         media_type="text/event-stream",
         headers={

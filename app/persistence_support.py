@@ -124,6 +124,7 @@ async def persist_stream_message(
     result_processor: Callable[..., Awaitable[None]],
     telemetry_processor: Callable[..., Awaitable[None]],
     dead_letter_processor: Callable[..., Awaitable[None]],
+    redis: aioredis.Redis | None = None,
 ) -> None:
     """Persist one new stream item and its matching durable UI event."""
     if not await claim_stream_message(session, stream_name, message_id):
@@ -133,12 +134,34 @@ async def persist_stream_message(
     if stream_name == result_stream:
         await result_processor(session, crawl_id, message_id, payload)
         if payload.get("url"):
+            # Compute current progress metrics for rich real-time SSE updates
+            crawl_obj = None
+            try:
+                crawl_res = await session.execute(select(Crawl).where(Crawl.id == crawl_uuid))
+                if hasattr(crawl_res, "scalar_one_or_none"):
+                    crawl_obj = crawl_res.scalar_one_or_none()
+            except Exception:
+                crawl_obj = None
+
+            processed_count = getattr(crawl_obj, "pages_processed", 1) or 1
+            config_dict = getattr(crawl_obj, "config", {}) or {}
+            max_pages_cfg = config_dict.get("max_pages", 15) if isinstance(config_dict, dict) else 15
+            calc_progress = min(0.95, round(processed_count / max_pages_cfg, 2)) if max_pages_cfg > 0 else 0.5
+
             await append_crawl_event(
                 session,
                 crawl_uuid,
                 "page.available",
-                {"crawl_id": crawl_id, "findings_updated": True},
+                {
+                    "crawl_id": crawl_id,
+                    "findings_updated": True,
+                    "url": payload.get("url"),
+                    "status": "running",
+                    "pages_processed": processed_count,
+                    "progress": calc_progress,
+                },
                 dedupe_key=persistence_event_key(stream_name, message_id),
+                redis=redis,
             )
     elif stream_name == telemetry_stream:
         await telemetry_processor(session, crawl_id, payload)
@@ -218,6 +241,7 @@ async def persist_stream_batch(
                         result_processor,
                         telemetry_processor,
                         dead_letter_processor,
+                        redis=redis,
                     )
                     acknowledgements.append(message_id)
                 except Exception as msg_exc:

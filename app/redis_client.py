@@ -66,6 +66,13 @@ def domain_throttle_key(crawl_id: str, domain: str) -> str:
     return f"crawl:{crawl_id}:throttle:domain:{domain}"
 
 
+def events_channel(crawl_id: str | None = None) -> str:
+    """Redis pub/sub channel for crawl events."""
+    if crawl_id:
+        return f"crawl:{crawl_id}:events"
+    return "crawl:all:events"
+
+
 def consumer_group_name(crawl_id: str) -> str:
     """Consumer group name scoped to a crawl."""
     return f"audit_workers:{crawl_id}"
