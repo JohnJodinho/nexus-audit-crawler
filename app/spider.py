@@ -81,7 +81,6 @@ _BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
 
 _BLOCK_BODY_SIGNALS: tuple[str, ...] = (
     "cf-browser-verification",
-    "cloudflare",
     "just a moment",
     "datadome",
     "enable javascript",
@@ -89,6 +88,9 @@ _BLOCK_BODY_SIGNALS: tuple[str, ...] = (
     "403 forbidden",
     "rate limit exceeded",
     "too many requests",
+    "<title>just a moment",
+    "challenges.cloudflare.com/cdn-cgi/challenge-platform",
+    "cdn-cgi/challenge-platform",
 )
 
 
