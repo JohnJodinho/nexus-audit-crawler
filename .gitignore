@@ -66,12 +66,7 @@ app/logs/
 
 # Research, Documentation & Untracked Local Files
 misc/
-!misc/
-misc/*
-misc/docs/*
 docs/
-!misc/docs/
-!misc/docs/frontend-api-contract.md
 docs_research/
 scratch/
 brain/
