@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     API_CORS_ORIGINS: str = (
         "https://console.jouledynamics.me,"
         "http://localhost:5173,"
-        "http://localhost:5174",
+        "http://localhost:5174,"
         "https://nexus-audit-console-five.vercel.app"
     )
     ENABLE_EXPORT_FEATURES: bool = True
