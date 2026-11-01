@@ -64,6 +64,7 @@ class Settings(BaseSettings):
         "http://localhost:5173,"
         "http://localhost:5174"
     )
+    ENABLE_EXPORT_FEATURES: bool = True
 
     APP_WRITE_PROJECT_ID: str = ""
     APP_WRITE_API_ENDPOINT: str = "https://cloud.appwrite.io/v1"

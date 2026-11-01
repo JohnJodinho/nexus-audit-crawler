@@ -39,6 +39,11 @@ from scrapling.fetchers import AsyncStealthySession, FetcherSession, ProxyRotato
 from scrapling.spiders import Request, Response, SessionManager, Spider
 
 from app.extraction import run_triple_threat
+from app.api.url_patterns import (
+    CompiledPattern,
+    compile_patterns,
+    evaluate_url,
+)
 from app.logger import LOG_FILE_PATH
 from app.telemetry import DropReason
 from app.redis_client import (
@@ -133,6 +138,7 @@ class AuditSpider(Spider):
         crawl_id: str,
         task_depth: int = 0,
         task_domain: str = "",
+        pattern_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -153,6 +159,36 @@ class AuditSpider(Spider):
         self._crawl_id: str = crawl_id
         self._task_depth: int = task_depth
         self._task_domain: str = task_domain
+        self._pattern_config = pattern_config or {}
+        self._target_origin = self._pattern_config.get("target_origin")
+        self._include_rules: tuple[CompiledPattern, ...] = ()
+        self._exclude_rules: tuple[CompiledPattern, ...] = ()
+        if self._target_origin:
+            self._include_rules = compile_patterns(
+                self._pattern_config.get("include_patterns", []),
+                rule_type="include",
+                target_origin=self._target_origin,
+            )
+            self._exclude_rules = compile_patterns(
+                self._pattern_config.get("exclude_patterns", []),
+                rule_type="exclude",
+                target_origin=self._target_origin,
+            )
+
+    def _evaluate_link(self, url: str):
+        target_origin = self._target_origin
+        if not target_origin:
+            parsed = urlparse(url)
+            target_origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+        return evaluate_url(
+            url,
+            target_origin=target_origin,
+            include_rules=self._include_rules,
+            exclude_rules=self._exclude_rules,
+            exclude_resource_types=tuple(
+                self._pattern_config.get("exclude_resource_types", [])
+            ),
+        )
 
     def configure_sessions(self, manager: SessionManager) -> None:
         """
@@ -308,6 +344,7 @@ class AuditSpider(Spider):
         page_emails: Set[str] = set()
         page_phones: Set[str] = set()
         page_seen_urls: Set[str] = set()
+        discovered_links: list[dict[str, Any]] = []
 
         links_found: int = 0
         links_queued: int = 0
@@ -431,6 +468,15 @@ class AuditSpider(Spider):
                 self.logger.debug("[GATE-2.5/FENCE] Offsite link dropped: %s", abs_url)
                 continue
 
+            discovered_links.append(
+                {
+                    "url": abs_url,
+                    "canonical_url": canonicalize_url(abs_url),
+                    "link_text": None,
+                    "is_internal": True,
+                }
+            )
+
             # Gate 3: deny list
             if DENY_PATTERN.search(parsed_url.path):
                 await self._redis.xadd(
@@ -445,6 +491,38 @@ class AuditSpider(Spider):
                     },
                 )
                 self.logger.debug("[GATE-3/DENY] %s", abs_url)
+                continue
+
+            pattern_decision = self._evaluate_link(abs_url)
+            if pattern_decision.decision == "excluded":
+                await self._redis.xadd(
+                    _telemetry_stream,
+                    {
+                        "schema_version": "1",
+                        "crawl_id": self._crawl_id,
+                        "timestamp_utc": _now(),
+                        "source_url": response.url,
+                        "target_url": pattern_decision.normalized_url,
+                        "drop_reason": "URL_PATTERN_EXCLUDED",
+                        "pattern_reason": pattern_decision.reason,
+                        "matched_rule_id": (
+                            pattern_decision.matched_rule.rule_id
+                            if pattern_decision.matched_rule
+                            else ""
+                        ),
+                        "normalized_origin": (
+                            self._target_origin
+                            or f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}"
+                        ),
+                        "normalized_path": pattern_decision.normalized_path,
+                        "inventory_status": "excluded",
+                    },
+                )
+                self.logger.debug(
+                    "[GATE-3/PATTERN] %s (%s)",
+                    abs_url,
+                    pattern_decision.reason,
+                )
                 continue
 
             # Gate 4: atomic discovery ledger
@@ -476,6 +554,27 @@ class AuditSpider(Spider):
                     "throttle_count": "0",
                     "domain": self._task_domain,
                     "published_at": _now(),
+                    "pattern_config": json.dumps(
+                        self._pattern_config,
+                        separators=(",", ":"),
+                    ),
+                },
+            )
+            await self._redis.xadd(
+                _telemetry_stream,
+                {
+                    "schema_version": "1",
+                    "crawl_id": self._crawl_id,
+                    "timestamp_utc": _now(),
+                    "source_url": response.url,
+                    "target_url": abs_url,
+                    "drop_reason": "URL_DISCOVERED",
+                    "normalized_origin": (
+                        self._target_origin
+                        or f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}"
+                    ),
+                    "normalized_path": pattern_decision.normalized_path,
+                    "inventory_status": "queued",
                 },
             )
 
@@ -532,6 +631,7 @@ class AuditSpider(Spider):
             response_time_ms=0.0,
         )
         extraction["metadata"] = audit_metadata
+        extraction["raw_html"] = html_text
 
         # -------------------------------------------------------------------
         # Optional Screenshot via Playwright & Appwrite
@@ -602,6 +702,10 @@ class AuditSpider(Spider):
             "xhr_payloads": json.dumps(item.get("xhr_payloads", []), ensure_ascii=False),
             "hydration_state": json.dumps(item.get("hydration_state"), ensure_ascii=False),
             "raw_markdown": item.get("raw_markdown", ""),
+            "raw_html": item.get("raw_html", ""),
+            "discovered_links": json.dumps(
+                item.get("discovered_links", []), ensure_ascii=False
+            ),
             "extraction_methods": json.dumps(extraction_methods),
             "contacts": json.dumps(
                 item.get("contacts", {"emails": [], "phones": []}),

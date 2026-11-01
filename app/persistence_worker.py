@@ -32,12 +32,14 @@ from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
+from app.inventory import upsert_inventory
 from app.db.engine import get_sessionmaker
 from app.models.schema import (
     AuditFinding,
     Crawl,
     Page,
     PageContact,
+    PageLink,
     init_db,
 )
 from app.persistence_support import (
@@ -93,7 +95,9 @@ async def process_result_message(
 
     # 1. Dual-Tier Storage: Upload raw Markdown to Appwrite Storage
     raw_markdown: str = payload.get("raw_markdown", "") or ""
+    raw_html: str = payload.get("raw_html", "") or ""
     markdown_file_id: Optional[str] = None
+    html_file_id: Optional[str] = None
     markdown_bytes: int = len(raw_markdown.encode("utf-8")) if raw_markdown else 0
     # Rough token count estimate (~4 chars per token)
     markdown_tokens: int = len(raw_markdown) // 4 if raw_markdown else 0
@@ -108,6 +112,15 @@ async def process_result_message(
         except Exception as storage_exc:
             log.error("[PERSIST] Storage upload failed for %s: %s", canonical, storage_exc)
             # Re-raise so the message is not XACKed and will be retried
+    if raw_html:
+        try:
+            html_file_id = await storage_client.upload_html(
+                crawl_id=crawl_id,
+                fingerprint=fingerprint,
+                html_text=raw_html,
+            )
+        except Exception as storage_exc:
+            log.error("[PERSIST] HTML storage upload failed for %s: %s", canonical, storage_exc)
     # 2. Parse JSON states and audit metadata
     json_state = payload.get("json_state")
     if isinstance(json_state, str):
@@ -190,8 +203,16 @@ async def process_result_message(
             metadata = json.loads(metadata)
         except Exception:
             metadata = {}
+    if html_file_id:
+        metadata = {**metadata, "html_file_id": html_file_id}
 
     screenshot_file_id = payload.get("screenshot_file_id") or None
+    discovered_links = payload.get("discovered_links", [])
+    if isinstance(discovered_links, str):
+        try:
+            discovered_links = json.loads(discovered_links)
+        except Exception:
+            discovered_links = []
 
     # 3. Upsert Page row in Postgres
     page_stmt = insert(Page).values(
@@ -230,6 +251,28 @@ async def process_result_message(
 
     page_res = await session.execute(page_stmt)
     page_id = page_res.scalar_one()
+    for link in discovered_links:
+        if not isinstance(link, dict) or not link.get("url"):
+            continue
+        link_stmt = insert(PageLink).values(
+            crawl_id=crawl_uuid,
+            from_page_id=page_id,
+            to_url=link["url"],
+            canonical_to_url=link.get("canonical_url") or canonicalize_url(link["url"]),
+            link_text=link.get("link_text"),
+            is_internal=bool(link.get("is_internal", True)),
+        ).on_conflict_do_nothing(constraint="uq_crawl_link")
+        await session.execute(link_stmt)
+    await upsert_inventory(
+        session,
+        crawl_uuid=crawl_uuid,
+        original_url=raw_url,
+        discovery_status="processed",
+        processing_status="processed",
+        page_id=page_id,
+        http_status=int(payload.get("status_code", 200)),
+        content_type=payload.get("content_type"),
+    )
 
     # 4. Insert extracted contacts
     emails = contacts_data.get("emails", [])

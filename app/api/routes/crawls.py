@@ -28,6 +28,11 @@ from app.api.schemas import (
     CrawlListResponse,
     CrawlResponse,
 )
+from app.api.url_patterns import (
+    PATTERN_GRAMMAR_VERSION,
+    normalize_pattern_list,
+    validate_pattern_list,
+)
 from app.models.schema import (
     AuditFinding,
     Crawl,
@@ -50,6 +55,45 @@ from app.utils.utilities import canonicalize_url, get_fingerprint
 log = logging.getLogger("audit_crawler.api.crawls")
 
 router = APIRouter()
+
+
+def _validate_requested_patterns(
+    payload: CrawlCreateRequest,
+    *,
+    target_origin: str,
+) -> None:
+    config = payload.config
+    if config is None:
+        return
+    requested = bool(
+        config.include_patterns
+        or config.exclude_patterns
+        or config.exclude_resource_types
+    )
+    if not requested:
+        return
+    issues = [
+        *validate_pattern_list(
+            config.include_patterns,
+            field="config.include_patterns",
+            target_origin=target_origin,
+        ),
+        *validate_pattern_list(
+            config.exclude_patterns,
+            field="config.exclude_patterns",
+            target_origin=target_origin,
+        ),
+    ]
+    if issues:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "INVALID_URL_PATTERN",
+                "message": "One or more URL patterns are invalid.",
+                "errors": issues,
+            },
+        )
+    return
 
 
 @router.get("", response_model=CrawlListResponse)
@@ -130,10 +174,31 @@ async def create_crawl(
             detail="Could not determine domain from URL.",
         )
 
+    target_origin = urlparse(canonical)._replace(
+        path="",
+        query="",
+        fragment="",
+    ).geturl()
+    _validate_requested_patterns(payload, target_origin=target_origin)
+
     seed_fp = get_fingerprint(canonical)
     lock_key = f"lock:crawl:seed:{seed_fp}"
 
     cfg = payload.config.model_dump() if payload.config else {}
+    if cfg.get("include_patterns") or cfg.get("exclude_patterns"):
+        cfg["include_patterns"] = normalize_pattern_list(
+            cfg["include_patterns"],
+            target_origin=target_origin,
+        )
+        cfg["exclude_patterns"] = normalize_pattern_list(
+            cfg["exclude_patterns"],
+            target_origin=target_origin,
+        )
+        cfg["pattern_grammar_version"] = PATTERN_GRAMMAR_VERSION
+    elif cfg.get("exclude_resource_types"):
+        cfg["pattern_grammar_version"] = PATTERN_GRAMMAR_VERSION
+    if cfg.get("pattern_grammar_version"):
+        cfg["target_origin"] = target_origin
     worker_count = cfg.get("worker_count", 2)
 
     if worker_count > 4:
@@ -215,6 +280,7 @@ async def create_crawl(
         domain=domain,
         crawl_id=crawl_id_str,
         depth=0,
+        pattern_config=cfg,
     )
 
     # 6. Immediately attach persistence consumer on Render to listen for results

@@ -33,6 +33,7 @@ import datetime
 import logging
 import sys
 import uuid
+import json
 from typing import Optional
 
 import anyio
@@ -69,6 +70,7 @@ async def publish_seed_url(
     domain: str,
     crawl_id: str,
     depth: int = 0,
+    pattern_config: Optional[dict] = None,
 ) -> str:
     """
     Enqueue a seed URL into the crawl-scoped task stream.
@@ -110,6 +112,8 @@ async def publish_seed_url(
         "domain": domain,
         "published_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
+    if pattern_config:
+        task_payload["pattern_config"] = json.dumps(pattern_config, separators=(",", ":"))
 
     message_id: str = await redis.xadd(tasks_key(crawl_id), task_payload)
 

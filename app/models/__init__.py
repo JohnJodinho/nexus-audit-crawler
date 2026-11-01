@@ -10,6 +10,10 @@ from app.models.schema import (
     Page,
     PageContact,
     PageLink,
+    UrlInventory,
+    ExportJob,
+    PreviewJob,
+    PreviewEvent,
 )
 
 __all__ = [
@@ -18,6 +22,10 @@ __all__ = [
     "Page",
     "PageContact",
     "PageLink",
+    "UrlInventory",
+    "ExportJob",
+    "PreviewJob",
+    "PreviewEvent",
     "DroppedTelemetry",
     "DeadLetterTask",
 ]

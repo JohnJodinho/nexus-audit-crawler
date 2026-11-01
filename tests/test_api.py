@@ -115,6 +115,13 @@ async def test_crawl_routes_reject_missing_bearer_token():
             for operation in operations.values():
                 assert {"BearerAuth": []} in operation.get("security", [])
     assert "security" not in app.openapi()["paths"]["/api/auth/login"]["post"]
+    crawl_config = app.openapi()["components"]["schemas"]["CrawlConfig"]["properties"]
+    assert "include_patterns" in crawl_config
+    assert "exclude_patterns" in crawl_config
+    paths = app.openapi()["paths"]
+    assert "/api/crawls/{crawl_id}/pages/{page_id}/content" in paths
+    assert "/api/crawls/{crawl_id}/exports/preview" in paths
+    assert "/api/crawls/{crawl_id}/exports/previews/{preview_id}/events" in paths
 
 
 @pytest.mark.asyncio
@@ -249,6 +256,28 @@ async def test_create_crawl_worker_count_exceeds_limit(client: AsyncClient):
     resp = await client.post("/api/crawls", json=payload)
     assert resp.status_code == 422
     assert "exceed" in resp.text.lower() or "less than or equal to 4" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_create_crawl_persists_validated_patterns(
+    client: AsyncClient,
+    mock_db_session: AsyncMock,
+):
+    mock_res = MagicMock()
+    mock_res.scalars.return_value.first.return_value = None
+    mock_db_session.execute.return_value = mock_res
+    response = await client.post(
+        "/api/crawls",
+        json={
+            "url": "https://example.com",
+            "config": {"exclude_patterns": ["/private/**"]},
+        },
+    )
+
+    assert response.status_code == 201
+    saved_crawl = mock_db_session.add.call_args.args[0]
+    assert saved_crawl.config["exclude_patterns"] == ["/private/**"]
+    assert saved_crawl.config["pattern_grammar_version"] == "1"
 
 
 
@@ -523,6 +552,52 @@ async def test_get_page_detail(client: AsyncClient, mock_db_session: AsyncMock):
     assert data["page"]["id"] == 1
     assert data["page"]["contacts"][0]["value"] == "info@example.com"
     assert len(data["findings"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_page_content_reports_unavailable_artifact(
+    client: AsyncClient,
+    mock_db_session: AsyncMock,
+):
+    page = Page(
+        id=1,
+        crawl_id=resolve_crawl_uuid("content-crawl"),
+        url="https://example.com",
+        canonical_url="https://example.com",
+        markdown_file_id=None,
+    )
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = page
+    mock_db_session.execute.return_value = result
+
+    response = await client.get("/api/crawls/content-crawl/pages/1/content")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "CONTENT_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_export_rejects_invalid_patterns_before_job_creation(
+    client: AsyncClient,
+    mock_db_session: AsyncMock,
+):
+    crawl = Crawl(
+        id=resolve_crawl_uuid("export-crawl"),
+        target_url="https://example.com",
+        target_domain="example.com",
+    )
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = crawl
+    mock_db_session.execute.return_value = result
+
+    response = await client.post(
+        "/api/crawls/export-crawl/exports/preview",
+        json={"include_patterns": ["not-a-relative-pattern"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_EXPORT_CONFIGURATION"
+    mock_db_session.add.assert_not_called()
 
 
 @pytest.mark.asyncio

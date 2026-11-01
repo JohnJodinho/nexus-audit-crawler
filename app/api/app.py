@@ -25,8 +25,10 @@ from app.api.routes import (
     control,
     crawls,
     events,
+    exports,
     findings,
     graph,
+    inspection,
     pages,
     status as status_route,
     summary,
@@ -189,8 +191,17 @@ def create_app() -> FastAPI:
     app.include_router(control.router, tags=["Lifecycle Control"], **protected_router_options)
     app.include_router(telemetry.router, tags=["Telemetry & DLQ"], **protected_router_options)
     app.include_router(graph.router, tags=["Graph & Export"], **protected_router_options)
+    if settings.ENABLE_EXPORT_FEATURES:
+        app.include_router(exports.router, tags=["Content Exports"], **protected_router_options)
     app.include_router(findings.router, tags=["Findings"], **protected_router_options)
     app.include_router(pages.router, tags=["Pages"], **protected_router_options)
+    app.include_router(inspection.router, tags=["Inspection"], **protected_router_options)
+    app.include_router(
+        inspection.url_rules_router,
+        prefix="/api",
+        tags=["URL Rules"],
+        dependencies=[Depends(require_authenticated_principal)],
+    )
     app.include_router(summary.router, tags=["Summary"], **protected_router_options)
     app.include_router(
         events.router,

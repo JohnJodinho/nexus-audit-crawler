@@ -16,6 +16,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -191,6 +192,45 @@ class PageLink(Base):
     )
 
 
+class UrlInventory(Base):
+    """Queryable URL state collected during a crawl."""
+
+    __tablename__ = "url_inventory"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    crawl_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("crawls.id", ondelete="CASCADE"), nullable=False
+    )
+    original_url: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_url: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_path: Mapped[str] = mapped_column(Text, nullable=False)
+    query_parameters: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
+    page_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("pages.id", ondelete="SET NULL"), nullable=True
+    )
+    discovery_status: Mapped[str] = mapped_column(String(16), nullable=False, default="discovered")
+    processing_status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    exclusion_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    matched_rule_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    content_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    discovered_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now()
+    )
+    processed_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("crawl_id", "normalized_url", name="uq_inventory_crawl_url"),
+        Index("ix_inventory_crawl_origin", "crawl_id", "origin"),
+        Index("ix_inventory_crawl_path", "crawl_id", "normalized_path"),
+        Index("ix_inventory_crawl_page", "crawl_id", "page_id"),
+        Index("ix_inventory_crawl_processing", "crawl_id", "processing_status"),
+    )
+
+
 class DroppedTelemetry(Base):
     """
     Log of links dropped by boundary gates or duplicate filters.
@@ -264,9 +304,69 @@ class ProcessedStreamMessage(Base):
     )
 
 
+class ExportJob(Base):
+    """Durable archive export job scoped to one crawl."""
+
+    __tablename__ = "export_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    crawl_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("crawls.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    request: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    result: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    archive_file_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+    completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class PreviewJob(Base):
+    """Durable URL-selection preview job."""
+
+    __tablename__ = "preview_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    crawl_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("crawls.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    request: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    result: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+    completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class PreviewEvent(Base):
+    """Replayable event emitted by a preview job."""
+
+    __tablename__ = "preview_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    preview_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("preview_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
 async def init_db(engine=None) -> None:
-    """Create all tables idempotently if they do not already exist."""
-    from app.db.engine import get_engine
-    target_engine = engine or get_engine()
-    async with target_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Apply the versioned schema migrations."""
+    from app.db.migrations import run_migrations
+
+    await run_migrations(engine)

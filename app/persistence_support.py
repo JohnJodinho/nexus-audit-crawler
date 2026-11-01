@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import resolve_crawl_uuid
 from app.api.event_log import append_crawl_event
+from app.inventory import upsert_inventory
 from app.models.schema import (
     Crawl,
     DeadLetterTask,
@@ -61,6 +62,16 @@ async def ensure_crawl_record(
 async def process_telemetry_message(session, crawl_id: str, payload: Dict[str, Any]) -> None:
     """Process a link drop telemetry message."""
     crawl_uuid = await ensure_crawl_record(session, crawl_id)
+    if payload.get("inventory_status"):
+        await upsert_inventory(
+            session,
+            crawl_uuid=crawl_uuid,
+            original_url=payload.get("target_url", ""),
+            discovery_status=payload.get("inventory_status", "discovered"),
+            processing_status=payload.get("inventory_status", "queued"),
+            exclusion_reason=payload.get("pattern_reason") or payload.get("drop_reason"),
+            matched_rule_id=payload.get("matched_rule_id") or None,
+        )
     session.add(
         DroppedTelemetry(
             crawl_id=crawl_uuid,
@@ -75,6 +86,15 @@ async def process_telemetry_message(session, crawl_id: str, payload: Dict[str, A
 async def process_dlq_message(session, crawl_id: str, payload: Dict[str, Any]) -> None:
     """Process a dead-letter queue message."""
     crawl_uuid = await ensure_crawl_record(session, crawl_id)
+    if payload.get("url"):
+        await upsert_inventory(
+            session,
+            crawl_uuid=crawl_uuid,
+            original_url=payload["url"],
+            discovery_status="failed",
+            processing_status="failed",
+            exclusion_reason=payload.get("dlq_reason", "failed"),
+        )
     session.add(
         DeadLetterTask(
             crawl_id=crawl_uuid,

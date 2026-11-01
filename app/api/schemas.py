@@ -25,6 +25,20 @@ class CrawlConfig(BaseModel):
         description="Worker concurrency count (must be between 1 and 4 to stay within free concurrency limits).",
     )
     categories: Optional[List[str]] = None
+    include_patterns: List[str] = Field(
+        default_factory=list,
+        description="Version 1 URL glob patterns to include; unavailable until crawl matching is implemented.",
+    )
+    exclude_patterns: List[str] = Field(
+        default_factory=list,
+        description="Version 1 URL glob patterns to exclude; unavailable until crawl matching is implemented.",
+    )
+    exclude_resource_types: List[
+        Literal["image", "document", "stylesheet", "script", "font", "media"]
+    ] = Field(
+        default_factory=list,
+        description="Resource classes excluded before content processing; unavailable until crawl matching is implemented.",
+    )
 
 
 class CrawlCreateRequest(BaseModel):
@@ -39,6 +53,37 @@ class CrawlCreateResponse(BaseModel):
     message: str
     is_duplicate: bool = False
     existing_crawl_id: Optional[str] = None
+
+
+class ExportRequest(BaseModel):
+    scope: Optional[str] = None
+    format: Literal["markdown", "html", "text"] = "markdown"
+    include_patterns: List[str] = Field(default_factory=list)
+    exclude_patterns: List[str] = Field(default_factory=list)
+    exclude_resource_types: List[
+        Literal["image", "document", "stylesheet", "script", "font", "media"]
+    ] = Field(default_factory=list)
+    include_assets: bool = False
+    include_metadata: bool = True
+    include_manifest: bool = True
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    crawl_id: str
+    status: str
+
+
+class ExportStatusResponse(JobResponse):
+    result: Dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class PreviewStatusResponse(JobResponse):
+    result: Dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

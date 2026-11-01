@@ -29,6 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import asyncio
 import datetime
+import json
 import logging
 import socket
 from typing import Any, Dict, Optional
@@ -144,6 +145,13 @@ async def worker_loop(
         retry_count: int = int(task_fields.get("retry_count", "0"))
         throttle_count: int = int(task_fields.get("throttle_count", "0"))
         domain: str = task_fields.get("domain", "")
+        pattern_config: Dict[str, Any] = {}
+        if task_fields.get("pattern_config"):
+            try:
+                pattern_config = json.loads(task_fields["pattern_config"])
+            except json.JSONDecodeError:
+                log.error("[WORKER:%s] Invalid pattern configuration in task %s", worker_id, message_id)
+                pattern_config = {}
 
         # --- Malformed task check --------------------------------------------
         if not url or not domain:
@@ -311,6 +319,7 @@ async def worker_loop(
                 url=url,
                 domain=domain,
                 depth=depth,
+                pattern_config=pattern_config,
             )
 
             if items_yielded == 0:
@@ -383,6 +392,8 @@ async def worker_loop(
                     "domain": domain,
                     "published_at": datetime.datetime.now(datetime.UTC).isoformat(),
                 }
+                if task_fields.get("pattern_config"):
+                    retry_payload["pattern_config"] = task_fields["pattern_config"]
                 await redis.xadd(_tasks_stream, retry_payload)
 
         finally:
@@ -413,6 +424,7 @@ async def _run_spider(
     url: str,
     domain: str,
     depth: int,
+    pattern_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Instantiate ``AuditSpider`` and run it for a single URL.
@@ -443,6 +455,7 @@ async def _run_spider(
         crawl_id=crawl_id,
         task_depth=depth,
         task_domain=domain,
+        pattern_config=pattern_config,
     )
     spider.start_urls = [url]
     spider.allowed_domains = {domain}
@@ -569,4 +582,3 @@ async def run_workers_for_crawl(crawl_id: str, worker_count: int = 2) -> None:
 
 if __name__ == "__main__":
     anyio.run(main)
-

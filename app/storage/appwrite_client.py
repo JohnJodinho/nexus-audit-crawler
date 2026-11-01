@@ -99,6 +99,27 @@ class AppwriteStorageClient:
             "text/markdown",
         )
 
+    async def upload_html(
+        self,
+        crawl_id: str,
+        fingerprint: str,
+        html_text: str,
+    ) -> str:
+        """Upload the original fetched HTML as a separately identified artifact."""
+        if not html_text or not self.bucket_id or not self.api_key or not self.project_id:
+            return ""
+        file_id = f"html_{fingerprint[:31]}"
+        filename = f"{fingerprint[:16]}.html"
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self._sync_upload,
+            file_id,
+            filename,
+            html_text.encode("utf-8"),
+            "text/html",
+        )
+
     async def upload_screenshot(
         self,
         crawl_id: str,
@@ -176,6 +197,22 @@ class AppwriteStorageClient:
             filename,
             data_bytes,
             mime_type,
+        )
+
+    async def download_bytes(self, file_id: str) -> bytes:
+        """Download an artifact through Appwrite without exposing credentials."""
+        if not self.bucket_id or not self.api_key or not self.project_id:
+            raise RuntimeError("Appwrite storage is not configured.")
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._sync_download, file_id)
+
+    def _sync_download(self, file_id: str) -> bytes:
+        storage = self._get_storage()
+        return bytes(
+            storage.get_file_download(
+                bucket_id=self.bucket_id,
+                file_id=file_id,
+            )
         )
 
     def _sync_upload(
