@@ -30,6 +30,7 @@ import datetime
 import json
 import logging
 import re
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse, unquote
 
@@ -316,6 +317,66 @@ class AuditSpider(Spider):
 
         return request
 
+    async def _explore_rendered_page(self, response: Response) -> bytes | None:
+        """Reveal bounded, user-visible page states before extraction."""
+        if not settings.DYNAMIC_INTERACTION_ENABLED:
+            return None
+        page = getattr(response, "page", None)
+        if page is None or not hasattr(page, "evaluate"):
+            return None
+
+        try:
+            await page.evaluate(
+                """async ({maxScrollSteps, maxInteractions, settleMs}) => {
+                    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                    const seen = new Set();
+                    for (let step = 0; step < maxScrollSteps; step += 1) {
+                        window.scrollTo(0, Math.min(
+                            document.body.scrollHeight,
+                            window.scrollY + Math.max(window.innerHeight * 0.8, 400)
+                        ));
+                        await sleep(settleMs);
+                        const controls = [...document.querySelectorAll(
+                            'button, summary, [aria-expanded="false"]'
+                        )].filter(element => {
+                            const text = (element.innerText || element.getAttribute('aria-label') || '').trim();
+                            const rect = element.getBoundingClientRect();
+                            const key = `${text}|${Math.round(rect.top)}|${Math.round(rect.left)}`;
+                            const type = (element.getAttribute('type') || '').toLowerCase();
+                            const reveal = /load|more|show|expand|read|tab|accordion|next|previous/i.test(text);
+                            const safe = text
+                                && !element.closest('a')
+                                && !['submit', 'file', 'reset'].includes(type)
+                                && (element.tagName.toLowerCase() === 'summary'
+                                    || element.getAttribute('aria-expanded') === 'false'
+                                    || reveal)
+                                && !/^(login|sign in|log in|subscribe|buy|checkout|delete|logout)$/i.test(text);
+                            if (!safe || seen.has(key)) return false;
+                            seen.add(key);
+                            return true;
+                        }).slice(0, maxInteractions - seen.size);
+                        for (const element of controls) {
+                            try { element.click(); } catch (_) {}
+                            await sleep(settleMs);
+                            if (seen.size >= maxInteractions) break;
+                        }
+                        if (window.scrollY + window.innerHeight >= document.body.scrollHeight - 4) break;
+                    }
+                    window.scrollTo(0, 0);
+                    await sleep(settleMs);
+                }""",
+                {
+                    "maxScrollSteps": settings.DYNAMIC_MAX_SCROLL_STEPS,
+                    "maxInteractions": settings.DYNAMIC_MAX_INTERACTIONS,
+                    "settleMs": settings.DYNAMIC_SETTLE_MS,
+                },
+            )
+            html = await page.content()
+            return html.encode("utf-8") if html else None
+        except Exception as exc:
+            self.logger.warning("[DYNAMIC] Interaction pass failed for %s: %s", response.url, exc)
+            return None
+
     async def parse(self, response: Response) -> AsyncGenerator[Any, None]:
         """
         Main parsing callback.
@@ -334,6 +395,20 @@ class AuditSpider(Spider):
         4. Atomic discovery ledger (``SADD crawl:{id}:set:queued_fingerprints``).
         5. Accept -- ``XADD crawl:{id}:stream:audit_tasks``.
         """
+        rendered_html = await self._explore_rendered_page(response)
+        extraction_response = response
+        if rendered_html:
+            extraction_response = SimpleNamespace(
+                url=response.url,
+                body=rendered_html,
+                encoding="utf-8",
+                captured_xhr=getattr(response, "captured_xhr", []),
+                status=getattr(response, "status", 200),
+                headers=getattr(response, "headers", {}),
+                page=getattr(response, "page", None),
+                request=getattr(response, "request", None),
+            )
+
         self.logger.info(
             "[PARSE] Processing (depth=%d): %s (HTTP %d)",
             self._task_depth,
@@ -588,7 +663,7 @@ class AuditSpider(Spider):
 
         loop = asyncio.get_event_loop()
         extraction: Dict[str, Any] = await loop.run_in_executor(
-            None, run_triple_threat, response, self.logger
+            None, run_triple_threat, extraction_response, self.logger
         )
 
         # Extract plain text contacts from rendered Markdown
@@ -613,7 +688,7 @@ class AuditSpider(Spider):
             except Exception:
                 headers_dict = {}
 
-        html_text = ""
+        html_text = rendered_html.decode("utf-8", errors="replace") if rendered_html else ""
         try:
             if hasattr(response, "text") and response.text:
                 html_text = str(response.text)
