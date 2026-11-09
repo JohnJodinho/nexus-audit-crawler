@@ -36,6 +36,12 @@ _job_tasks: dict[str, asyncio.Task] = {}
 _MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
 
+def _export_file_id(job_id: str) -> str:
+    """Return a stable Appwrite file ID within its 36-character limit."""
+    identifier = job_id.removeprefix("export-")
+    return f"exp_{identifier[:32]}"
+
+
 def _track(task: asyncio.Task) -> None:
     _background_jobs.add(task)
     task.add_done_callback(_background_jobs.discard)
@@ -200,7 +206,7 @@ async def _finish_export(job: ExportJob, archive_bytes: bytes, manifest: dict[st
     job.status = "completed_with_errors" if manifest["unavailable_content"] else "completed"
     job.result = manifest
     job.archive_file_id = await storage_client.upload_bytes(
-        f"export_{job.id[:30]}",
+        _export_file_id(job.id),
         f"{job.id}.zip",
         archive_bytes,
         "application/zip",
