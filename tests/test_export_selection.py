@@ -83,8 +83,8 @@ async def test_root_scope_includes_every_path_on_the_crawl_origin():
         UrlInventory(
             id=index,
             crawl_id=crawl_uuid,
-            original_url=f"https://example.com{path}",
-            normalized_url=f"https://example.com{path}",
+            original_url=f"https://example.com/{path.lstrip('/')}",
+            normalized_url=f"https://example.com/{path.lstrip('/')}",
             origin="https://example.com",
             normalized_path=path,
             query_parameters={},
@@ -107,6 +107,56 @@ async def test_root_scope_includes_every_path_on_the_crawl_origin():
     assert result.counts["included"] == 4
     assert result.counts["outside_scope"] == 0
     assert [item.decision for item in result.items] == ["included"] * 4
+
+
+@pytest.mark.asyncio
+async def test_root_scope_includes_persisted_pages_despite_stale_inventory_status():
+    crawl_uuid = uuid.uuid4()
+    crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com/",
+        target_domain="example.com",
+    )
+    paths = ["/", "/about", "/courses"]
+    pages = [
+        Page(
+            id=index,
+            crawl_id=crawl_uuid,
+            url=f"https://example.com{path}",
+            canonical_url=f"https://example.com{path}",
+            markdown_file_id=f"md-{index}",
+            fetched_at=datetime.datetime.now(datetime.UTC),
+        )
+        for index, path in enumerate(paths, start=1)
+    ]
+    inventories = [
+        UrlInventory(
+            id=index,
+            crawl_id=crawl_uuid,
+            original_url=page.url,
+            normalized_url=page.canonical_url,
+            origin="https://example.com",
+            normalized_path=paths[index - 1],
+            query_parameters={},
+            page_id=page.id,
+            discovery_status="processed",
+            processing_status="excluded" if index > 1 else "processed",
+        )
+        for index, page in enumerate(pages, start=1)
+    ]
+
+    result = await select_inventory(
+        _Session([inventories, pages]),
+        crawl=crawl,
+        scope="https://example.com",
+        format_type="markdown",
+        include_patterns=[],
+        exclude_patterns=[],
+    )
+
+    assert result.counts["included"] == 3
+    assert result.counts["excluded"] == 0
+    assert [item.content_status for item in result.items] == ["available"] * 3
 
 
 def test_root_scope_candidate_query_does_not_filter_by_path_prefix():

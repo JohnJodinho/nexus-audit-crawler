@@ -135,7 +135,10 @@ async def select_inventory(
                 )
             )
             continue
-        if inventory.processing_status in {"excluded", "failed"}:
+        if (
+            inventory.processing_status in {"excluded", "failed"}
+            and page is None
+        ):
             items.append(
                 SelectionItem(
                     inventory, page, "excluded", inventory.exclusion_reason or "crawl_restriction",
