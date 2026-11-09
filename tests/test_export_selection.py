@@ -2,8 +2,10 @@ import datetime
 import uuid
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.export_selection import select_inventory
+from app.export_selection import _candidate_query
 from app.models.schema import Crawl, Page, UrlInventory
 
 
@@ -76,7 +78,7 @@ async def test_root_scope_includes_every_path_on_the_crawl_origin():
         target_url="https://example.com/",
         target_domain="example.com",
     )
-    paths = ["/about", "/courses", "/facilities"]
+    paths = ["/about", "/courses", "/facilities", "legacy-path-without-leading-slash"]
     inventories = [
         UrlInventory(
             id=index,
@@ -102,6 +104,15 @@ async def test_root_scope_includes_every_path_on_the_crawl_origin():
         exclude_patterns=[],
     )
 
-    assert result.counts["included"] == 3
+    assert result.counts["included"] == 4
     assert result.counts["outside_scope"] == 0
-    assert [item.decision for item in result.items] == ["included"] * 3
+    assert [item.decision for item in result.items] == ["included"] * 4
+
+
+def test_root_scope_candidate_query_does_not_filter_by_path_prefix():
+    statement = _candidate_query(uuid.uuid4(), "https://example.com", "/")
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "url_inventory.normalized_path LIKE" not in sql
+    assert "url_inventory.crawl_id" in sql
+    assert "url_inventory.origin" in sql

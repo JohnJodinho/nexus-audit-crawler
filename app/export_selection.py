@@ -51,7 +51,7 @@ class SelectionResult:
 
 def _scope_contains(scope_path: str, candidate_path: str) -> bool:
     if scope_path == "/":
-        return candidate_path.startswith("/")
+        return True
     return candidate_path == scope_path or candidate_path.startswith(f"{scope_path}/")
 
 
@@ -68,11 +68,13 @@ def _content_status(page: Page | None, format_type: str) -> str:
 
 
 def _candidate_query(crawl_uuid, origin: str, scope_path: str):
-    return select(UrlInventory).where(
+    query = select(UrlInventory).where(
         UrlInventory.crawl_id == crawl_uuid,
         UrlInventory.origin == origin,
-        UrlInventory.normalized_path.startswith(scope_path),
-    ).order_by(UrlInventory.id.asc())
+    )
+    if scope_path != "/":
+        query = query.where(UrlInventory.normalized_path.startswith(scope_path))
+    return query.order_by(UrlInventory.id.asc())
 
 
 async def select_inventory(
