@@ -66,3 +66,42 @@ async def test_selection_reuses_persisted_inventory_and_pattern_engine():
     assert result.counts["included"] == 1
     assert result.items[0].content_status == "available"
     assert result.items[0].matched_rule is not None
+
+
+@pytest.mark.asyncio
+async def test_root_scope_includes_every_path_on_the_crawl_origin():
+    crawl_uuid = uuid.uuid4()
+    crawl = Crawl(
+        id=crawl_uuid,
+        target_url="https://example.com/",
+        target_domain="example.com",
+    )
+    paths = ["/about", "/courses", "/facilities"]
+    inventories = [
+        UrlInventory(
+            id=index,
+            crawl_id=crawl_uuid,
+            original_url=f"https://example.com{path}",
+            normalized_url=f"https://example.com{path}",
+            origin="https://example.com",
+            normalized_path=path,
+            query_parameters={},
+            page_id=None,
+            discovery_status="processed",
+            processing_status="processed",
+        )
+        for index, path in enumerate(paths, start=1)
+    ]
+
+    result = await select_inventory(
+        _Session([inventories, []]),
+        crawl=crawl,
+        scope="https://example.com",
+        format_type="markdown",
+        include_patterns=[],
+        exclude_patterns=[],
+    )
+
+    assert result.counts["included"] == 3
+    assert result.counts["outside_scope"] == 0
+    assert [item.decision for item in result.items] == ["included"] * 3

@@ -50,6 +50,8 @@ class SelectionResult:
 
 
 def _scope_contains(scope_path: str, candidate_path: str) -> bool:
+    if scope_path == "/":
+        return candidate_path.startswith("/")
     return candidate_path == scope_path or candidate_path.startswith(f"{scope_path}/")
 
 
